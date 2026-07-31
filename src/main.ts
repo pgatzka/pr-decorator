@@ -15,3 +15,5 @@ void run()
 // probe: src changed without rebuilding dist/
 
 const unusedProbe: any = 1
+
+// probe: src changed without rebuilding dist/

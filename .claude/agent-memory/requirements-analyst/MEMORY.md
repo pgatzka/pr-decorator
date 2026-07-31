@@ -1,0 +1,3 @@
+- [pr-decorator scope](project-pr-decorator-scope.md) — greenfield repo; the Action IS the deliverable, follows GitHub's OFFICIAL writing docs; settled v1 spec lives in milestone 1
+- [Issue-count waiver](feedback-issue-count-waiver.md) — user waived the 3–8 issues rule for pr-decorator v1; full unphased breakdown is wanted
+- [Repo house style location](reference-repo-writing-rules.md) — this repo's issue/PR conventions live in the issue templates + `.claude/agents/*`; process only, not the product spec
