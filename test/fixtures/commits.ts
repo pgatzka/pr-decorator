@@ -1,18 +1,14 @@
+import type { CommitPayload } from '../../src/github/client'
 import type { RenderableCommit } from '../../src/types'
 
 /**
  * The subset of a `GET /repos/{owner}/{repo}/pulls/{number}/commits` list item
- * that the action reads. Kept alongside the {@link RenderableCommit} builder so
- * the two stay in sync: the client maps the former onto the latter.
+ * that the action reads. Aliased to the client's own type rather than restated,
+ * so a fixture can never drift from the shape the client actually returns; it
+ * lives alongside the {@link RenderableCommit} builder because the render layer
+ * maps the former onto the latter.
  */
-export interface RawCommit {
-  sha: string
-  commit: {
-    author: { name: string; email: string; date: string } | null
-    message: string
-  }
-  author: { login: string } | null
-}
+export type RawCommit = CommitPayload
 
 const DEFAULT_FULL_SHA = '0f1e2d3c4b5a69788796a5b4c3d2e1f009e8d7c6'
 
