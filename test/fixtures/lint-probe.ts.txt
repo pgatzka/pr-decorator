@@ -1,0 +1,16 @@
+// Probe for the src/render/** layering rule. Committed as .txt so it is neither
+// compiled nor linted where it lives; the check copies it into a layer and lints
+// the copy:
+//
+//   cp test/fixtures/lint-probe.ts.txt src/render/__lint_probe.ts
+//   npx eslint src/render/__lint_probe.ts   # must exit non-zero
+//   cp test/fixtures/lint-probe.ts.txt src/github/__lint_probe.ts
+//   npx eslint src/github/__lint_probe.ts   # must exit zero
+//
+// Copies are deleted afterwards and never committed. Keep this file otherwise
+// lint-clean, so the only thing that can fail it is the layering rule.
+import { context } from '@actions/github'
+
+export function probeRepositoryName(): string {
+  return context.repo.repo
+}

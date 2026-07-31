@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Test and coverage output
+coverage/
+*.log
+npm-debug.log*
+
+# Editor and OS cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*~
+
+# dist/ is intentionally NOT ignored: the ncc bundle is committed on every PR.

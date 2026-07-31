@@ -1,0 +1,47 @@
+name: 'pr-decorator'
+description: 'Writes a deterministic, marker-delimited summary block into a pull request body: closing reference, commit list and footer.'
+author: 'Philipp Gatzka'
+
+branding:
+  icon: 'edit-3'
+  color: 'purple'
+
+inputs:
+  timezone:
+    description: 'IANA timezone name (for example Europe/Berlin) used to render commit author timestamps. Required; there is deliberately no default.'
+    required: true
+  token:
+    description: 'Token used to read the pull request and write its body. Needs pull-requests: write.'
+    required: false
+    default: '${{ github.token }}'
+  position:
+    description: 'Where the managed block is placed on first write: top or bottom. Later runs keep the block where it already is.'
+    required: false
+    default: 'top'
+  issue-link:
+    description: 'Emit the "Closes #N" line derived from the head branch name.'
+    required: false
+    default: 'true'
+  branch-pattern:
+    description: 'Regular expression matched against the head branch name; capture group 1 is the issue number.'
+    required: false
+    default: '^(\d+)-'
+  footer:
+    description: 'Emit the generated-by footer line at the end of the managed block.'
+    required: false
+    default: 'true'
+  mentions:
+    description: 'How commit authors are rendered: login for @mentions, name for the plain git author name.'
+    required: false
+    default: 'login'
+  dry-run:
+    description: 'Render the block and log it without writing to the pull request.'
+    required: false
+    default: 'false'
+
+# v1 deliberately declares no outputs. Adding them later is additive and does not
+# require a major tag.
+
+runs:
+  using: 'node24'
+  main: 'dist/index.js'

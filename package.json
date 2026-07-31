@@ -1,0 +1,34 @@
+{
+  "name": "pr-decorator",
+  "version": "1.0.0",
+  "description": "GitHub Action that writes a deterministic, marker-delimited summary block into a pull request body.",
+  "private": true,
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "test": "vitest run",
+    "build": "tsc --noEmit",
+    "package": "ncc build src/main.ts -o dist --source-map --license licenses.txt"
+  },
+  "keywords": [
+    "github-action",
+    "pull-request"
+  ],
+  "author": "Philipp Gatzka",
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/github": "^9.1.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.0.0",
+    "@vercel/ncc": "^0.38.4",
+    "eslint": "^10.8.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^3.0.0",
+    "yaml": "^2.8.0"
+  }
+}
