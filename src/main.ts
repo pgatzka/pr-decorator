@@ -11,3 +11,5 @@ export async function run(): Promise<void> {
 
 // Not top-level await: the ncc bundle is CommonJS.
 void run()
+
+// probe: src changed without rebuilding dist/
