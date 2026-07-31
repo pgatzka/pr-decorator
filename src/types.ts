@@ -44,9 +44,17 @@ export interface RenderableCommit {
    * differently formatted timestamp.
    */
   authoredAt: Date
-  /** Already-resolved author rendering — `@login`, or the plain git name. */
+  /**
+   * Already-resolved AND already-escaped author rendering — `@login`, or the plain
+   * git name. The bullet renderer emits it verbatim.
+   */
   mention: string
-  /** First line of the commit message, already neutralized for GFM. */
+  /**
+   * The commit message, exactly as the API served it. Deliberately NOT pre-escaped
+   * and deliberately not pre-trimmed to one line: the bullet renderer takes the
+   * first line and neutralizes it, so there is exactly one place where an
+   * attacker-controlled subject is made safe.
+   */
   subject: string
 }
 
