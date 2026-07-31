@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Superseded runs on the same ref are pointless: only the tip of a branch can be
+# merged, so cancel everything older.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI only reads the repository. It never writes and never touches a secret; the
+# freshness gate below is what forces contributors to commit dist/ themselves.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint, test and verify the bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # node-version must stay on the same major as `runs.using` in action.yml,
+      # otherwise the bundle is built by a runtime the action never executes on.
+      # test/ci-workflow.test.ts fails the build if the two drift apart.
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build the bundle
+        run: npm run package
+
+      # A JavaScript action executes dist/index.js, not src/. A pull request that
+      # edits src/ without rebuilding would ship a bundle that does not match the
+      # reviewed source, so a rebuild that changes anything under dist/ is a
+      # failure. `git diff` covers tracked files; `git status --porcelain` also
+      # catches a newly emitted chunk that is not tracked yet.
+      #
+      # .gitattributes marks dist/** as `-diff linguist-generated=true`, which
+      # suppresses the patch text in review and in `git diff` output — it does
+      # not affect the exit code, which is what this gate reads.
+      - name: Verify dist/ matches src/
+        run: |
+          if ! git diff --exit-code dist/ || [ -n "$(git status --porcelain dist/)" ]; then
+            echo "::error::dist/ is stale. Run 'npm run package' and commit the dist/ changes."
+            git status --porcelain dist/
+            exit 1
+          fi
