@@ -92,13 +92,13 @@ const GOLDEN_CASES: readonly GoldenCase[] = [
     options: sectionOptions({ totalCount: 2, returnedCount: 2 }),
   },
   {
-    rule: 'an issue reference in a subject is escaped and closes nothing',
+    rule: 'an issue reference in a subject is wrapped and closes nothing',
     file: 'subject-issue-reference',
     commits: commitWithSubject('fix: stop the crash, fixes #12 for good'),
     options: sectionOptions({}),
   },
   {
-    rule: 'a team mention in a subject is escaped and notifies nobody',
+    rule: 'a team mention in a subject is wrapped and notifies nobody',
     file: 'subject-team-mention',
     commits: commitWithSubject('chore: hand ownership to @org/team'),
     options: sectionOptions({}),
@@ -107,6 +107,12 @@ const GOLDEN_CASES: readonly GoldenCase[] = [
     rule: 'marker text in a subject is removed outright',
     file: 'subject-marker',
     commits: commitWithSubject(`feat: stop decorating ${END_MARKER} and move on`),
+    options: sectionOptions({}),
+  },
+  {
+    rule: 'a subject carrying backticks is fenced so it cannot break out',
+    file: 'subject-backticks',
+    commits: commitWithSubject('docs: explain `npm ci` and ``nested`` spans'),
     options: sectionOptions({}),
   },
   {
@@ -200,7 +206,7 @@ describe('the reference output, field by field', () => {
       false,
     ])
     expect(section.endsWith('\n')).toBe(false)
-    expect(section.endsWith('edge case')).toBe(true)
+    expect(section.endsWith('edge case`')).toBe(true)
   })
 })
 
@@ -209,25 +215,40 @@ describe('subject neutralization', () => {
     return fieldsOf(renderCommitBullet(buildCommit({ subject }), RENDER_OPTIONS))[3]
   }
 
-  it('escapes the issue-reference sigil wherever it appears', () => {
-    expect(subjectOf('fixes #12')).toBe('fixes \\#12')
-    expect(subjectOf('#12 fixed')).toBe('\\#12 fixed')
-    expect(subjectOf('closes #1 and #2')).toBe('closes \\#1 and \\#2')
+  it('wraps an issue reference so no backslash is needed and none is added', () => {
+    // The backslash escape this replaced was measured against live GitHub and did
+    // not stop the closing-keyword pass — an escaped subject still closed the
+    // issue it named. A code span does, and it is the whole subject that is
+    // wrapped, because that is the form the measurement proved.
+    expect(subjectOf('fixes #12')).toBe('`fixes #12`')
+    expect(subjectOf('#12 fixed')).toBe('`#12 fixed`')
+    expect(subjectOf('closes #1 and #2')).toBe('`closes #1 and #2`')
   })
 
-  it('escapes the mention sigil wherever it appears', () => {
-    expect(subjectOf('thanks @org/team')).toBe('thanks \\@org/team')
-    expect(subjectOf('@alice reported it')).toBe('\\@alice reported it')
+  it('wraps a mention rather than escaping it', () => {
+    expect(subjectOf('thanks @org/team')).toBe('`thanks @org/team`')
+    expect(subjectOf('@alice reported it')).toBe('`@alice reported it`')
+  })
+
+  it('emits no backslash of its own for any sigil', () => {
+    // The regression that motivated the change: a subject picking up a `\` here
+    // would render the backslash visibly inside the span, and would be evidence
+    // that escaping crept back in alongside the wrapper.
+    for (const subject of ['fixes #12', '@alice', 'a|b', '<b>bold</b>', '*em*']) {
+      expect(subjectOf(subject)).toBe(`\`${subject}\``)
+    }
   })
 
   it.each([START_MARKER, END_MARKER, SKIP_MARKER])('removes %s outright', (marker) => {
+    // Not merely inert: a code span hides a marker from the RENDERER, but the
+    // block parser scans lines, so an unremoved marker would still cut the block.
     const rendered = subjectOf(`before ${marker} after`)
-    expect(rendered).toBe('before  after')
+    expect(rendered).toBe('`before  after`')
     expect(rendered).not.toContain('pr-decorator')
   })
 
   it('removes a marker-shaped comment whose name it has never seen', () => {
-    expect(subjectOf('a <!-- pr-decorator:invented -->b')).toBe('a b')
+    expect(subjectOf('a <!-- pr-decorator:invented -->b')).toBe('`a b`')
   })
 
   it('strips repeatedly, so removal cannot assemble a new marker', () => {
@@ -235,33 +256,91 @@ describe('subject neutralization', () => {
     // gap the inner comment left. This is the bug the fixed-point loop exists for.
     const nested = '<!-- pr-<!-- pr-decorator:x -->decorator:skip -->'
     const rendered = subjectOf(`chore: ${nested}`)
-    expect(rendered).toBe('chore:')
+    expect(rendered).toBe('`chore:`')
     expect(rendered).not.toContain('pr-decorator')
   })
 
   it('does not let two markers swallow the text between them', () => {
-    expect(subjectOf(`a ${START_MARKER} keep ${END_MARKER} b`)).toBe('a  keep  b')
+    expect(subjectOf(`a ${START_MARKER} keep ${END_MARKER} b`)).toBe('`a  keep  b`')
   })
 
   it('keeps only the first line of a multi-line message', () => {
-    expect(subjectOf('subject\n\nbody with #12 and @alice')).toBe('subject')
-    expect(subjectOf('subject\r\nbody')).toBe('subject')
+    expect(subjectOf('subject\n\nbody with #12 and @alice')).toBe('`subject`')
+    expect(subjectOf('subject\r\nbody')).toBe('`subject`')
   })
 
   it('collapses a stray carriage return that no line split removed', () => {
-    expect(subjectOf('subject\rtail')).toBe('subject tail')
+    expect(subjectOf('subject\rtail')).toBe('`subject tail`')
   })
 
-  it('does not escape a backslash the message already carried', () => {
-    // Only `#` and `@` are escaped. A message about a Windows path is prose, and
-    // doubling its backslashes would be this module inventing content.
-    expect(subjectOf('fix: handle C:\\temp paths')).toBe('fix: handle C:\\temp paths')
+  it('does not double a backslash the message already carried', () => {
+    // Nothing is escaped any more, so a message about a Windows path is carried
+    // through untouched — and inside a code span the backslash is literal by the
+    // spec rather than by this module's restraint.
+    expect(subjectOf('fix: handle C:\\temp paths')).toBe('`fix: handle C:\\temp paths`')
   })
 
   it('falls back rather than ending the bullet on a dangling separator', () => {
     expect(subjectOf('')).toBe('(no subject)')
     expect(subjectOf('   ')).toBe('(no subject)')
     expect(subjectOf(SKIP_MARKER)).toBe('(no subject)')
+  })
+
+  it('leaves the fallback unwrapped, so a real "(no subject)" is distinguishable', () => {
+    // Outside a span means this action wrote it; inside means the commit did.
+    expect(subjectOf('(no subject)')).toBe('`(no subject)`')
+    expect(subjectOf('')).not.toContain('`')
+  })
+})
+
+describe('a subject that contains backticks cannot break out of its span', () => {
+  function subjectOf(subject: string): string | undefined {
+    return fieldsOf(renderCommitBullet(buildCommit({ subject }), RENDER_OPTIONS))[3]
+  }
+
+  it('fences one longer than the longest run inside', () => {
+    expect(subjectOf('use `npm ci` here')).toBe('``use `npm ci` here``')
+    expect(subjectOf('a ``b`` c')).toBe('```a ``b`` c```')
+    expect(subjectOf('```')).toBe('```` ``` ````')
+  })
+
+  it('pads when the subject starts or ends with a backtick', () => {
+    // GFM strips one space from each end only when both ends carry one, so the
+    // padding is symmetric even though only one edge needs it.
+    expect(subjectOf('`leading')).toBe('`` `leading ``')
+    expect(subjectOf('trailing`')).toBe('`` trailing` ``')
+    expect(subjectOf('`both`')).toBe('`` `both` ``')
+  })
+
+  it('does not pad a subject with no edge backtick', () => {
+    expect(subjectOf('plain')).toBe('`plain`')
+  })
+
+  it('renders back to the original subject, for every shape above', () => {
+    // The property the fencing exists for: whatever the commit said is what a
+    // reader sees. Mirrors the spec's own rule — strip the fence, then one space
+    // from each end when both are spaces.
+    for (const subject of [
+      'plain',
+      'use `npm ci` here',
+      'a ``b`` c',
+      '```',
+      '`leading',
+      'trailing`',
+      '`both`',
+      'fixes #12',
+    ]) {
+      const rendered = subjectOf(subject) ?? ''
+      const fence = /^`+/.exec(rendered)?.[0] ?? ''
+      expect(rendered.endsWith(fence)).toBe(true)
+
+      const inner = rendered.slice(fence.length, rendered.length - fence.length)
+      const unpadded =
+        inner.startsWith(' ') && inner.endsWith(' ') && inner.trim() !== ''
+          ? inner.slice(1, -1)
+          : inner
+      expect(unpadded).toBe(subject)
+    }
   })
 })
 
@@ -373,10 +452,10 @@ describe('order belongs to the client', () => {
       .slice(2)
       .map((bullet) => fieldsOf(bullet)[3])
     expect(subjects).toEqual([
-      'Add the parser',
-      'Handle the empty input',
-      'Fix the off-by-one',
-      'Document the parser',
+      '`Add the parser`',
+      '`Handle the empty input`',
+      '`Fix the off-by-one`',
+      '`Document the parser`',
     ])
   })
 

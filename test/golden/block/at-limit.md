@@ -3,7 +3,7 @@ Closes #142
 
 ## Commits
 
-- 2026-07-28 09:14 — [`aaaaaaa`](https://github.com/pgatzka/pr-decorator/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0) — @a-rather-long-but-legal-github-login-x — feat(auth): rotate the refresh tokens and then some more rotate the refr
+- 2026-07-28 09:14 — [`aaaaaaa`](https://github.com/pgatzka/pr-decorator/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0) — @a-rather-long-but-legal-github-login-x — `feat(auth): rotate the refresh tokens and then some more rotate the refr`
 
 … and 249 more commits
 
