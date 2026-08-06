@@ -33,6 +33,8 @@ Git author names get the same treatment, and for the same reason: a name comes f
 
 The code span is not cosmetic. GitHub's closing-keyword pass reads the pull request body, so a commit subject saying it fixes an issue would otherwise close that issue the moment the pull request merges — and a backslash escape does **not** stop it, which was measured against live GitHub rather than assumed. A code span does. It is also what keeps a subject or a name from emitting a mention, so nobody is notified because of what someone wrote in a commit.
 
+What that buys you is narrow, and worth being precise about: **the block this action writes cannot close your issues.** It does not make the pull request as a whole safe — see [What this action cannot protect you from](#what-this-action-cannot-protect-you-from).
+
 The rendered markdown targets GitHub-Flavored Markdown as documented on [docs.github.com](https://docs.github.com/en/get-started/writing-on-github) and in the [Pull requests REST reference](https://docs.github.com/en/rest/pulls/pulls). That is the format authority — not a convention local to this repository.
 
 ### Opting a pull request out
@@ -150,6 +152,16 @@ The default `${{ github.token }}` does **not** trigger further workflow runs —
 The only loop guard in this action is the **byte-identical block comparison**: before writing, the body is re-read and the new body is compared to the current one; if they are identical, no request is made and the chain stops. There is deliberately no actor check and no bot-name check — either could be defeated by a self-hosted or renamed identity, whereas the comparison cannot.
 
 In practice: with a PAT, do not put `edited` in your `types:` list.
+
+### What this action cannot protect you from
+
+GitHub reads closing keywords from **two** places when a pull request merges: the pull request body, and the commit messages that land on your default branch. This action owns the first and has no say over the second.
+
+So a contributor whose commit subject reads `fixes #12` still closes your issue 12 — not through the block, which renders that subject inertly, but because the commit message itself reaches your default branch. A merge commit preserves it. So does a squash, if the squash message keeps it, and if your repository has *Default to PR title and description for squash merge commits* enabled then the pull request **description** becomes commit-message text too, where markdown means nothing and a code span is just three backticks.
+
+This is not a defect you can configure around here. If it matters to you, it is a branch-protection and merge-policy question: review commit subjects, or squash with a message you control.
+
+Both halves were measured on this repository rather than inferred — see [#16](https://github.com/pgatzka/pr-decorator/issues/16) for the pull-request-body pathway and the commit-message pathway that closed two issues in the merges that shipped the fix.
 
 ### Limitations
 
