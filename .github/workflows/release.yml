@@ -1,0 +1,108 @@
+name: Release
+
+# Consumers pin `uses: pgatzka/pr-decorator@v1`, so the moving `v1` tag IS the
+# distribution mechanism: whatever it points at is what every workflow in the world
+# runs on its next invocation. Moving it is therefore the one irreversible act in
+# this repository, and everything below exists to make sure a broken bundle cannot
+# be what it moves to.
+on:
+  release:
+    types: [published]
+
+# Two releases published in quick succession would race for the tag and the loser
+# would win, because a force-push has no ordering guarantee. Serialized instead of
+# cancelled: an in-flight release must finish, not be abandoned halfway.
+concurrency:
+  group: release-v1
+  cancel-in-progress: false
+
+# `contents: write` is needed for exactly one thing — force-pushing the `v1` tag.
+# Nothing here reads or writes a pull request, an issue, a package or a deployment,
+# so nothing else is granted. No secret is referenced anywhere in this file; the
+# push authenticates with the checkout-persisted GITHUB_TOKEN.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, smoke-test and move the v1 tag
+    runs-on: ubuntu-latest
+
+    steps:
+      # The released tag, explicitly, rather than whatever the event's default ref
+      # resolves to. The commit checked out here is the commit `v1` will point at.
+      - name: Check out the released commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # Same major as `runs.using` in action.yml and as `engines.node` in
+      # package.json. Building the shipped bundle on a runtime the action never
+      # executes on is exactly the kind of drift the smoke test below cannot see,
+      # because a bundle can load fine on the wrong major and misbehave later.
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the bundle
+        run: npm run package
+
+      # The gate. A JavaScript action fails in a way no unit test can reach: the
+      # bundle itself does not load, or `src/index.ts` is not wired to `run()`, and
+      # every consumer discovers it at once. So the real artifact is executed here,
+      # in the state it will be tagged in.
+      #
+      # INPUT_TIMEZONE unset is the cheapest possible proof: it drives the action
+      # all the way to its fail-fast input check with no token, no network and no
+      # pull request. Reaching that check means the bundle loaded, the entrypoint
+      # ran and the orchestration is reachable.
+      #
+      # SHARED INVARIANT: the asserted `::error::` line and its literal `timezone`
+      # token are owned by src/inputs.ts (#9). Rewording that message requires
+      # updating this step in the same change, or the release stops on a bundle
+      # that is perfectly fine.
+      - name: Smoke-test the bundle
+        env:
+          # Belt and braces: the runner sets no INPUT_* for a `run:` step, but an
+          # empty value reaches the same check as an absent one either way.
+          INPUT_TIMEZONE: ''
+        run: |
+          set -uo pipefail
+
+          if output="$(node dist/index.js 2>&1)"; then
+            echo "::error::The bundle exited 0 with INPUT_TIMEZONE unset. The fail-fast input check did not run, so the entrypoint is not wired up. Refusing to move v1."
+            printf '%s\n' "$output"
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$output" | grep -q '^::error::.*timezone'; then
+            echo "::error::The bundle exited non-zero but printed no ::error:: line naming timezone. Refusing to move v1."
+            printf '%s\n' "$output"
+            exit 1
+          fi
+
+          echo "Smoke test passed: the bundle exited non-zero with an ::error:: line naming timezone."
+
+      # Skipped for a pre-release, which is what makes publishing one a genuine dry
+      # run of everything above: the bundle is built and executed, and consumers are
+      # left on the `v1` they already have.
+      - name: Move the v1 tag to the released commit
+        if: ${{ !github.event.release.prerelease }}
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # Annotated, so `git show v1` says which release moved it and when.
+          git tag --force --annotate v1 --message "pr-decorator ${RELEASE_TAG}" HEAD
+          git push --force origin refs/tags/v1
+
+          echo "v1 now points at $(git rev-parse HEAD) (${RELEASE_TAG})." >> "$GITHUB_STEP_SUMMARY"
