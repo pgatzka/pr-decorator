@@ -29,7 +29,9 @@ Piece by piece:
 
 Commit subjects come from whoever opened the pull request, so they are neutralized before they land: each one is rendered inside a code span, and anything shaped like one of this action's HTML comment markers is removed outright.
 
-The code span is not cosmetic. GitHub's closing-keyword pass reads the pull request body, so a commit subject saying it fixes an issue would otherwise close that issue the moment the pull request merges — and a backslash escape does **not** stop it, which was measured against live GitHub rather than assumed. A code span does. It is also what keeps a subject from emitting a mention, so nobody is notified because of what someone wrote in a commit message.
+Git author names get the same treatment, and for the same reason: a name comes from whatever the contributor put in `git config user.name`. It is used whenever there is no `@login` to render — with `mentions: name`, and under the default `mentions: login` whenever GitHub cannot match a commit's email to an account, which is the common case for fork contributors. An `@login` is *not* wrapped, because a mention inside a code span would stop notifying anyone.
+
+The code span is not cosmetic. GitHub's closing-keyword pass reads the pull request body, so a commit subject saying it fixes an issue would otherwise close that issue the moment the pull request merges — and a backslash escape does **not** stop it, which was measured against live GitHub rather than assumed. A code span does. It is also what keeps a subject or a name from emitting a mention, so nobody is notified because of what someone wrote in a commit.
 
 The rendered markdown targets GitHub-Flavored Markdown as documented on [docs.github.com](https://docs.github.com/en/get-started/writing-on-github) and in the [Pull requests REST reference](https://docs.github.com/en/rest/pulls/pulls). That is the format authority — not a convention local to this repository.
 
@@ -83,7 +85,7 @@ There is no `actions/checkout` step, and there does not need to be: the action r
 | `issue-link` | boolean | `true` | no | Emit the `Closes #N` line derived from the head branch name. |
 | `branch-pattern` | regular expression | `^(\d+)-` | no | Matched against the head branch name; capture group 1 is read as the issue number. Must declare at least one capturing group, otherwise the run fails at input parsing rather than silently rendering no line. |
 | `footer` | boolean | `true` | no | Emit the generated-by footer line at the end of the block. |
-| `mentions` | `login` \| `name` | `login` | no | How commit authors are rendered: `login` for `@mentions`, `name` for the plain git author name. |
+| `mentions` | `login` \| `name` | `login` | no | How commit authors are rendered: `login` for `@mentions`, `name` for the git author name. A git name is contributor-controlled, so it is rendered in a code span; an `@login` is not, because a wrapped mention would not notify. |
 | `dry-run` | boolean | `false` | no | Render the block and log it without writing to the pull request. |
 
 Booleans accept the spellings the Actions toolkit accepts: `true`, `True`, `TRUE`, `false`, `False`, `FALSE`.

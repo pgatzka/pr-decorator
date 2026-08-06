@@ -493,10 +493,11 @@ describe('module boundaries', () => {
     expect(source).toContain('formatInstant')
   })
 
-  it('takes the marker literal from the module that owns it', () => {
+  it('takes its neutralization from the module that owns it', () => {
     // Retyping a marker here is the failure mode that orphans a pull request body
-    // permanently, so the text must arrive by import.
-    expect(source).toContain("from '../body/markers'")
+    // permanently, and a second copy of the code-span rule is the one that does
+    // not get fixed — so both arrive by import.
+    expect(source).toContain("from '../markdown'")
     expect(source).not.toContain('pr-decorator:start')
     expect(source).not.toContain('pr-decorator:end')
     expect(source).not.toContain('pr-decorator:skip')

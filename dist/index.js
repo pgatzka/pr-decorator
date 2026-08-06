@@ -37344,6 +37344,102 @@ async function guardedWrite(write) {
     }
 }
 
+;// CONCATENATED MODULE: ./src/markdown.ts
+/**
+ * The two primitives every field carrying untrusted text goes through.
+ *
+ * A commit subject and a git author name arrive from different places and are
+ * assembled by different modules, but they are the same kind of string: whoever
+ * opened the pull request chose the bytes. Both were once made safe by escaping
+ * markdown's special characters, and that turned out not to be safe at all (D7) —
+ * an escaped `\#12` stops RENDERING as an issue link while GitHub's
+ * closing-keyword pass reads straight through the backslash, so a commit that said
+ * it fixed an issue still closed that issue on merge.
+ *
+ * They live here rather than in either caller because one copy of this rule is the
+ * only defensible number. The second copy is the one that does not get fixed.
+ */
+
+/**
+ * `<!-- pr-decorator:` — the opening every marker shares, sliced off the real
+ * marker rather than retyped. A typo in a retyped marker is the failure mode that
+ * lets a crafted string smuggle a genuine marker into the body, so the literal has
+ * exactly one home and this is not it.
+ */
+const MARKER_OPENING = START_MARKER.slice(0, START_MARKER.indexOf(':') + 1);
+/**
+ * Any HTML comment of the marker shape, whether or not the name is one this action
+ * knows — an unknown `<!-- pr-decorator:whatever -->` is still ours to strip.
+ *
+ * Non-greedy, so two markers in one string do not swallow the text between them.
+ * None of the opening's characters are regex metacharacters, which is why it is
+ * used as pattern source verbatim.
+ */
+const MARKER_SHAPED = new RegExp(`${MARKER_OPENING}.*?-->`, 'g');
+/**
+ * Every run of backticks in a string. The fence has to be longer than the longest
+ * of them, otherwise the first run inside the content closes the span early and the
+ * rest of the line renders as markup again.
+ *
+ * Safe to reuse despite the `g` flag: `String.prototype.match` resets `lastIndex`
+ * before it scans, so a previous call cannot make the next one start mid-string.
+ */
+const BACKTICK_RUNS = /`+/g;
+/**
+ * Removes every marker-shaped comment, repeatedly, until the text stops changing.
+ *
+ * Still required even for text that ends up inside a code span. A code span hides a
+ * marker from the RENDERER, and the module that finds the managed block scans lines
+ * instead of rendering markdown — so an unremoved marker would still cut the block
+ * in half wherever it appeared.
+ *
+ * One pass is not enough. `<!-- pr-<!-- pr-decorator:x -->decorator:skip -->`
+ * strips its inner comment and what closes over the gap is a real skip marker —
+ * removal that creates the thing being removed is the classic sanitizer bug. Each
+ * pass strictly shortens the string, so the loop terminates.
+ *
+ * @param text - Untrusted text, before any wrapping.
+ * @returns The same text with every marker-shaped comment removed. Surrounding
+ *   whitespace is deliberately left behind, as visible evidence of the removal.
+ */
+function stripMarkerShapedComments(text) {
+    let current = text;
+    for (;;) {
+        const stripped = current.replace(MARKER_SHAPED, '');
+        if (stripped === current) {
+            return current;
+        }
+        current = stripped;
+    }
+}
+/**
+ * Wraps text in a code span that its own content cannot escape from.
+ *
+ * Two rules from the GFM spec, both load-bearing rather than defensive:
+ *
+ * - The fence is one backtick longer than the longest run inside the content, so
+ *   nothing in the content can close the span early.
+ * - When the content starts or ends with a backtick, a space goes on each side. The
+ *   renderer strips one space from each end only when BOTH ends carry one, so
+ *   padding both sides is what makes an edge backtick survive as visible text
+ *   instead of merging into the fence.
+ *
+ * Content that is entirely whitespace would be destroyed by that stripping rule,
+ * which is why every caller resolves the empty case before reaching here.
+ *
+ * @param content - The text to render inertly, already stripped and trimmed.
+ * @returns The fenced code span, ready to be concatenated into a line.
+ */
+function codeSpan(content) {
+    let longestRun = 0;
+    for (const run of content.match(BACKTICK_RUNS) ?? []) {
+        longestRun = Math.max(longestRun, run.length);
+    }
+    const fence = '`'.repeat(longestRun + 1);
+    const padding = content.startsWith('`') || content.endsWith('`') ? ' ' : '';
+    return `${fence}${padding}${content}${padding}${fence}`;
+}
+
 ;// CONCATENATED MODULE: ./src/github/authors.ts
 /**
  * Author rendering for the commit bullet.
@@ -37360,11 +37456,22 @@ async function guardedWrite(write) {
  * a mention on GitHub, and `web-flow` is the web editor's identity rather than
  * the person who pressed the button.
  *
- * **The returned string is final.** It is fully escaped here and the bullet
- * renderer emits it verbatim. That split is the whole point: this module escapes
- * names, the renderer escapes subjects, and neither re-escapes the other's
- * output, so a name can never pick up a second backslash.
+ * **The returned string is final.** It is fully neutralized here and the bullet
+ * renderer emits it verbatim. That split is the whole point: this module owns the
+ * author field, the renderer owns the subject, and neither re-processes the
+ * other's output.
+ *
+ * The two are neutralized differently because they are different kinds of string.
+ * A git author name is untrusted — whoever pushed the commit chose it with
+ * `git config user.name` — so it goes into a code span, exactly like a subject and
+ * for the same measured reason (D7): a backslash escape leaves GitHub's
+ * closing-keyword pass free to act, so a contributor named after a closing keyword
+ * and an issue number would close that issue on merge. A LOGIN is not untrusted in
+ * that way. It comes from GitHub's own namespace, cannot contain a `#` or an `@`,
+ * and in the `@login` case it MUST stay unwrapped — a code span would render a
+ * mention inert, and notifying is the point of rendering one at all.
  */
+
 /** Rendered when no usable name exists at all, so the field is never blank. */
 const UNKNOWN_AUTHOR = 'unknown';
 /** GitHub appends this to every App identity; such a login is not mentionable. */
@@ -37372,31 +37479,45 @@ const BOT_LOGIN_SUFFIX = '[bot]';
 /** The account GitHub attributes web-editor commits to. Not a person. */
 const WEB_EDITOR_LOGIN = 'web-flow';
 /**
- * Every character that could turn a name into markup inside a bullet: emphasis,
- * code, link and image syntax, raw HTML, an issue reference, a mention, and the
- * table cell separator. The backslash is first in the class for the human
- * reader; the regex is applied in one pass, so an inserted backslash is never
- * itself re-escaped.
+ * The characters that could turn a LOGIN into markup: link and image syntax, and
+ * raw HTML. A documented login is alphanumeric plus `-`, so this is a no-op on
+ * every real one and exists because no API string should reach the body unchecked
+ * — with one exception that matters, the `[bot]` suffix, whose raw brackets would
+ * otherwise bind to a `[bot]: …` reference definition left elsewhere in the body.
+ *
+ * The backslash is first in the class for the human reader; the regex is applied in
+ * one pass, so an inserted backslash is never itself re-escaped.
  */
-const MARKDOWN_SPECIAL = /[\\`*_[\]<>#@|]/g;
+const LOGIN_SPECIAL = /[\\`*_[\]<>|]/g;
 /** Any run of whitespace, including the CR and LF that would break the bullet. */
 const WHITESPACE_RUN = /\s+/g;
 /**
- * Collapses a git author name or login to a single line and escapes it.
+ * Collapses a login to a single line and escapes what markdown would act on.
+ *
+ * Escaping rather than wrapping, because the caller may prefix an `@` to the
+ * result and that mention has to stay live. See the note at the top of the file for
+ * why a login can be treated this way and a git name cannot.
+ */
+function neutralizeLogin(text) {
+    return text.replace(WHITESPACE_RUN, ' ').trim().replace(LOGIN_SPECIAL, '\\$&');
+}
+/**
+ * The git author trailer's name, made inert, or {@link UNKNOWN_AUTHOR} if unusable.
  *
  * Whitespace collapsing comes first and is not cosmetic: a newline inside
  * `user.name` would end the bullet and let the rest of the name render as a new
- * list item. Escaping second means a literal `<!-- pr-decorator:end -->` in a
- * name survives as visible text but no longer matches the marker the block
- * parser looks for, because both angle brackets carry a backslash.
+ * list item. Marker text is then removed outright rather than wrapped — a code span
+ * hides a marker from the renderer, but the block parser scans lines, so a marker
+ * left inside one would still cut the managed block in half.
+ *
+ * {@link UNKNOWN_AUTHOR} is deliberately NOT wrapped: inside a code span means the
+ * commit supplied it, outside means this action did, so a contributor who really is
+ * called `unknown` is still distinguishable from a missing trailer.
  */
-function neutralize(text) {
-    return text.replace(WHITESPACE_RUN, ' ').trim().replace(MARKDOWN_SPECIAL, '\\$&');
-}
-/** The git author trailer's name, escaped, or {@link UNKNOWN_AUTHOR} if unusable. */
 function gitAuthorName(apiCommit) {
-    const name = neutralize(apiCommit.commit.author?.name ?? '');
-    return name === '' ? UNKNOWN_AUTHOR : name;
+    const raw = apiCommit.commit.author?.name ?? '';
+    const name = stripMarkerShapedComments(raw.replace(WHITESPACE_RUN, ' ')).trim();
+    return name === '' ? UNKNOWN_AUTHOR : codeSpan(name);
 }
 /**
  * Resolves the rendered author for one commit.
@@ -37419,24 +37540,24 @@ function resolveMention(apiCommit, mentions) {
     if (mentions === 'name') {
         return gitAuthorName(apiCommit);
     }
-    // Classified on the raw login, emitted through `neutralize`. Doing it the
+    // Classified on the raw login, emitted through `neutralizeLogin`. Doing it the
     // other way round would compare against an escaped `\[bot\]`.
     const login = apiCommit.author?.login.trim() ?? '';
     if (login === '') {
         return gitAuthorName(apiCommit);
     }
     if (login.endsWith(BOT_LOGIN_SUFFIX)) {
-        // Escaped like any other plain text, which is what stops the `[bot]` suffix
-        // from binding to a reference link definition someone left in the body.
-        return neutralize(login);
+        // Escaped rather than wrapped, so it still reads as a name beside the plain
+        // `@mentions` around it. Safe to leave unwrapped: the dangerous sigils cannot
+        // occur in a login, and the brackets that CAN are escaped here.
+        return neutralizeLogin(login);
     }
     if (login === WEB_EDITOR_LOGIN) {
         return gitAuthorName(apiCommit);
     }
-    // Documented logins are alphanumeric plus `-`, so `neutralize` is a no-op on
-    // every real one. It runs anyway: this module's contract is that no API string
-    // reaches the body unescaped, and the `@` sigil below is ours, not theirs.
-    return `@${neutralize(login)}`;
+    // The `@` sigil is ours, not theirs, and it has to stay live — this is the one
+    // field in the block that is meant to notify somebody.
+    return `@${neutralizeLogin(login)}`;
 }
 
 ;// CONCATENATED MODULE: ./src/github/client.ts
@@ -37932,10 +38053,11 @@ function parseInputs() {
  *   place a timezone is ever applied (D8). A formatter here would be a second
  *   answer to the same question, and the goldens would stop proving anything.
  *
- * Mentions arrive already escaped from the author resolver and are emitted
- * verbatim — escaping them again renders a visible backslash. Subjects are the
+ * Mentions arrive already neutralized from the author resolver and are emitted
+ * verbatim — wrapping them again would nest a span inside a span. Subjects are the
  * opposite: they arrive raw, and neutralizing them is this module's job. Neither
- * side ever touches the other's output.
+ * side ever touches the other's output, and both reach for the same two primitives
+ * so the rule cannot drift into two versions.
  */
 
 
@@ -37957,77 +38079,10 @@ const NO_COMMITS_LINE = 'No commits.';
  * on a dangling separator.
  */
 const EMPTY_SUBJECT = '(no subject)';
-/**
- * `<!-- pr-decorator:` — the opening every marker shares, sliced off the real
- * marker rather than retyped. A typo in a retyped marker is the failure mode that
- * lets a crafted subject smuggle a genuine marker into the body, so the literal
- * has exactly one home and this is not it.
- */
-const MARKER_OPENING = START_MARKER.slice(0, START_MARKER.indexOf(':') + 1);
-/**
- * Any HTML comment of the marker shape, whether or not the name is one this action
- * knows — an unknown `<!-- pr-decorator:whatever -->` is still ours to strip.
- *
- * Non-greedy, so two markers in one subject do not swallow the text between them.
- * None of the opening's characters are regex metacharacters, which is why it is
- * used as pattern source verbatim.
- */
-const MARKER_SHAPED = new RegExp(`${MARKER_OPENING}.*?-->`, 'g');
-/**
- * Every run of backticks in a subject. The fence has to be longer than the longest
- * of them, otherwise the first run inside the subject closes the span early and the
- * rest of the bullet renders as markup again.
- *
- * Safe to reuse despite the `g` flag: `String.prototype.match` resets `lastIndex`
- * before it scans, so a previous call cannot make the next one start mid-string.
- */
-const BACKTICK_RUNS = /`+/g;
 /** Line breaks that would end the bullet and let the rest render as new markup. */
 const LINE_BREAKS = /[\r\n]+/g;
 /** Trailing slashes on the URL base, so a base with one does not produce `//`. */
 const TRAILING_SLASHES = /\/+$/;
-/**
- * Removes every marker-shaped comment, repeatedly, until the text stops changing.
- *
- * One pass is not enough. `<!-- pr-<!-- pr-decorator:x -->decorator:skip -->`
- * strips its inner comment and what closes over the gap is a real skip marker —
- * removal that creates the thing being removed is the classic sanitizer bug. Each
- * pass strictly shortens the string, so the loop terminates.
- */
-function stripMarkers(text) {
-    let current = text;
-    for (;;) {
-        const stripped = current.replace(MARKER_SHAPED, '');
-        if (stripped === current) {
-            return current;
-        }
-        current = stripped;
-    }
-}
-/**
- * Wraps text in a code span that no content can escape from.
- *
- * Two rules from the GFM spec, both load-bearing rather than defensive:
- *
- * - The fence is one backtick longer than the longest run inside the content, so
- *   nothing in the subject can close the span early.
- * - When the content starts or ends with a backtick, a space goes on each side.
- *   The renderer strips one space from each end only when BOTH ends carry one, so
- *   padding both sides is what makes an edge backtick survive as visible text
- *   instead of merging into the fence.
- *
- * Content that is entirely whitespace would be destroyed by that stripping rule,
- * which is why the caller resolves the empty case before reaching here.
- */
-function codeSpan(content) {
-    let longestRun = 0;
-    for (const run of content.match(BACKTICK_RUNS) ?? []) {
-        longestRun = Math.max(longestRun, run.length);
-    }
-    const fence = '`'.repeat(longestRun + 1);
-    const padding = content.startsWith('`') || content.endsWith('`') ? ' ' : '';
-    return `${fence}${padding}${content}${padding}${fence}`;
-}
 /**
  * Reduces a commit message to one safe, inert line (D7).
  *
@@ -38045,7 +38100,7 @@ function codeSpan(content) {
  */
 function neutralizeSubject(message) {
     const firstLine = message.split('\n', 1)[0] ?? '';
-    const subject = stripMarkers(firstLine).replace(LINE_BREAKS, ' ').trim();
+    const subject = stripMarkerShapedComments(firstLine).replace(LINE_BREAKS, ' ').trim();
     return subject === '' ? EMPTY_SUBJECT : codeSpan(subject);
 }
 /** Joins the URL base and the FULL sha — the short one is for display only. */
