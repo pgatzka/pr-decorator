@@ -37904,11 +37904,19 @@ function parseInputs() {
  *
  * This is the part of the block that renders untrusted input. A commit subject on
  * a public fork pull request is written by whoever opened it, so every subject
- * passes through the neutralizer below before it reaches the body: the `#` and `@`
- * sigils GitHub acts on are escaped, and anything shaped like one of this action's
- * own HTML comment markers is removed outright rather than escaped, so a crafted
- * subject can neither close the managed block nor opt the pull request out of
- * decoration.
+ * passes through the neutralizer below before it reaches the body: it is wrapped
+ * in a code span, which is what makes the sigils GitHub acts on inert, and
+ * anything shaped like one of this action's own HTML comment markers is removed
+ * outright rather than wrapped, so a crafted subject can neither close the managed
+ * block nor opt the pull request out of decoration.
+ *
+ * The code span replaced a backslash escape, and the reason is measured rather
+ * than assumed (D7). An escaped `\#12` stops rendering as an issue link, which is
+ * all a golden file can see — and GitHub's closing-keyword pass reads straight
+ * through the backslash anyway, so a subject saying it fixes an issue still closed
+ * that issue on merge. A code span suppresses both. The two cannot be combined: a
+ * backslash inside a code span is a literal backslash, so the escape had to go
+ * rather than gain a wrapper.
  *
  * A bullet list and never a table. A table cell has to escape `|` as well, it wraps
  * badly on the pull request page, and a single malformed row breaks the whole grid
@@ -37926,8 +37934,8 @@ function parseInputs() {
  *
  * Mentions arrive already escaped from the author resolver and are emitted
  * verbatim — escaping them again renders a visible backslash. Subjects are the
- * opposite: they arrive raw, and escaping them is this module's job. Neither side
- * ever touches the other's output.
+ * opposite: they arrive raw, and neutralizing them is this module's job. Neither
+ * side ever touches the other's output.
  */
 
 
@@ -37966,10 +37974,14 @@ const MARKER_OPENING = START_MARKER.slice(0, START_MARKER.indexOf(':') + 1);
  */
 const MARKER_SHAPED = new RegExp(`${MARKER_OPENING}.*?-->`, 'g');
 /**
- * The two sigils GitHub acts on inside prose: `#` opens an issue reference, `@` a
- * mention. Escaped, both render as themselves, close nothing and notify nobody.
+ * Every run of backticks in a subject. The fence has to be longer than the longest
+ * of them, otherwise the first run inside the subject closes the span early and the
+ * rest of the bullet renders as markup again.
+ *
+ * Safe to reuse despite the `g` flag: `String.prototype.match` resets `lastIndex`
+ * before it scans, so a previous call cannot make the next one start mid-string.
  */
-const GFM_SIGILS = /[#@]/g;
+const BACKTICK_RUNS = /`+/g;
 /** Line breaks that would end the bullet and let the rest render as new markup. */
 const LINE_BREAKS = /[\r\n]+/g;
 /** Trailing slashes on the URL base, so a base with one does not produce `//`. */
@@ -37993,20 +38005,48 @@ function stripMarkers(text) {
     }
 }
 /**
- * Reduces a commit message to one safe line of prose (D7).
+ * Wraps text in a code span that no content can escape from.
  *
- * Marker text is stripped BEFORE the sigils are escaped: escaping first would let
- * `<!-- pr-decorator:@ -->` survive as an unrecognized-but-marker-shaped comment.
- * Whitespace is deliberately not collapsed — removing a marker leaves the spaces
- * that surrounded it, which is visible evidence that something was taken out.
+ * Two rules from the GFM spec, both load-bearing rather than defensive:
  *
- * The result stays prose rather than a code span: a subject is meant to be read,
- * and a code span would make a 70-character message a horizontal scrollbar.
+ * - The fence is one backtick longer than the longest run inside the content, so
+ *   nothing in the subject can close the span early.
+ * - When the content starts or ends with a backtick, a space goes on each side.
+ *   The renderer strips one space from each end only when BOTH ends carry one, so
+ *   padding both sides is what makes an edge backtick survive as visible text
+ *   instead of merging into the fence.
+ *
+ * Content that is entirely whitespace would be destroyed by that stripping rule,
+ * which is why the caller resolves the empty case before reaching here.
+ */
+function codeSpan(content) {
+    let longestRun = 0;
+    for (const run of content.match(BACKTICK_RUNS) ?? []) {
+        longestRun = Math.max(longestRun, run.length);
+    }
+    const fence = '`'.repeat(longestRun + 1);
+    const padding = content.startsWith('`') || content.endsWith('`') ? ' ' : '';
+    return `${fence}${padding}${content}${padding}${fence}`;
+}
+/**
+ * Reduces a commit message to one safe, inert line (D7).
+ *
+ * Marker text is stripped BEFORE the span is applied, and stripping still matters
+ * even though a code span renders an HTML comment as visible text: the block
+ * parser finds its markers by scanning lines, not by rendering markdown, so a
+ * marker inside a code span would still terminate the block. Whitespace is
+ * deliberately not collapsed — removing a marker leaves the spaces that surrounded
+ * it, which is visible evidence that something was taken out.
+ *
+ * The fallback is deliberately NOT wrapped, which makes it self-identifying:
+ * anything in a code span came from the commit, anything outside one came from
+ * this action, so a commit whose subject really is `(no subject)` still reads as
+ * the author's own words.
  */
 function neutralizeSubject(message) {
     const firstLine = message.split('\n', 1)[0] ?? '';
     const subject = stripMarkers(firstLine).replace(LINE_BREAKS, ' ').trim();
-    return subject === '' ? EMPTY_SUBJECT : subject.replace(GFM_SIGILS, '\\$&');
+    return subject === '' ? EMPTY_SUBJECT : codeSpan(subject);
 }
 /** Joins the URL base and the FULL sha — the short one is for display only. */
 function commitUrl(base, fullSha) {
@@ -38032,7 +38072,7 @@ function commitNoun(count) {
  * @param commit - One commit, already reduced to what the render layer needs.
  * @param options - The timezone and the base repository's commit URL prefix.
  * @returns One line, no trailing newline, e.g.
- *   `- 2026-07-28 09:14 — [\`a1b2c3d\`](…/a1b2c3d4…) — @alice — feat: rotate tokens`.
+ *   ``- 2026-07-28 09:14 — [`a1b2c3d`](…/a1b2c3d4…) — @alice — `feat: rotate tokens` ``.
  */
 function renderCommitBullet(commit, options) {
     const fields = [
