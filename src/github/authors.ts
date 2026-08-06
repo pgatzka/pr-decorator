@@ -13,12 +13,23 @@
  * a mention on GitHub, and `web-flow` is the web editor's identity rather than
  * the person who pressed the button.
  *
- * **The returned string is final.** It is fully escaped here and the bullet
- * renderer emits it verbatim. That split is the whole point: this module escapes
- * names, the renderer escapes subjects, and neither re-escapes the other's
- * output, so a name can never pick up a second backslash.
+ * **The returned string is final.** It is fully neutralized here and the bullet
+ * renderer emits it verbatim. That split is the whole point: this module owns the
+ * author field, the renderer owns the subject, and neither re-processes the
+ * other's output.
+ *
+ * The two are neutralized differently because they are different kinds of string.
+ * A git author name is untrusted — whoever pushed the commit chose it with
+ * `git config user.name` — so it goes into a code span, exactly like a subject and
+ * for the same measured reason (D7): a backslash escape leaves GitHub's
+ * closing-keyword pass free to act, so a contributor named after a closing keyword
+ * and an issue number would close that issue on merge. A LOGIN is not untrusted in
+ * that way. It comes from GitHub's own namespace, cannot contain a `#` or an `@`,
+ * and in the `@login` case it MUST stay unwrapped — a code span would render a
+ * mention inert, and notifying is the point of rendering one at all.
  */
 
+import { codeSpan, stripMarkerShapedComments } from '../markdown'
 import type { MentionStyle } from '../types'
 
 import type { CommitPayload } from './client'
@@ -33,34 +44,48 @@ const BOT_LOGIN_SUFFIX = '[bot]'
 const WEB_EDITOR_LOGIN = 'web-flow'
 
 /**
- * Every character that could turn a name into markup inside a bullet: emphasis,
- * code, link and image syntax, raw HTML, an issue reference, a mention, and the
- * table cell separator. The backslash is first in the class for the human
- * reader; the regex is applied in one pass, so an inserted backslash is never
- * itself re-escaped.
+ * The characters that could turn a LOGIN into markup: link and image syntax, and
+ * raw HTML. A documented login is alphanumeric plus `-`, so this is a no-op on
+ * every real one and exists because no API string should reach the body unchecked
+ * — with one exception that matters, the `[bot]` suffix, whose raw brackets would
+ * otherwise bind to a `[bot]: …` reference definition left elsewhere in the body.
+ *
+ * The backslash is first in the class for the human reader; the regex is applied in
+ * one pass, so an inserted backslash is never itself re-escaped.
  */
-const MARKDOWN_SPECIAL = /[\\`*_[\]<>#@|]/g
+const LOGIN_SPECIAL = /[\\`*_[\]<>|]/g
 
 /** Any run of whitespace, including the CR and LF that would break the bullet. */
 const WHITESPACE_RUN = /\s+/g
 
 /**
- * Collapses a git author name or login to a single line and escapes it.
+ * Collapses a login to a single line and escapes what markdown would act on.
+ *
+ * Escaping rather than wrapping, because the caller may prefix an `@` to the
+ * result and that mention has to stay live. See the note at the top of the file for
+ * why a login can be treated this way and a git name cannot.
+ */
+function neutralizeLogin(text: string): string {
+  return text.replace(WHITESPACE_RUN, ' ').trim().replace(LOGIN_SPECIAL, '\\$&')
+}
+
+/**
+ * The git author trailer's name, made inert, or {@link UNKNOWN_AUTHOR} if unusable.
  *
  * Whitespace collapsing comes first and is not cosmetic: a newline inside
  * `user.name` would end the bullet and let the rest of the name render as a new
- * list item. Escaping second means a literal `<!-- pr-decorator:end -->` in a
- * name survives as visible text but no longer matches the marker the block
- * parser looks for, because both angle brackets carry a backslash.
+ * list item. Marker text is then removed outright rather than wrapped — a code span
+ * hides a marker from the renderer, but the block parser scans lines, so a marker
+ * left inside one would still cut the managed block in half.
+ *
+ * {@link UNKNOWN_AUTHOR} is deliberately NOT wrapped: inside a code span means the
+ * commit supplied it, outside means this action did, so a contributor who really is
+ * called `unknown` is still distinguishable from a missing trailer.
  */
-function neutralize(text: string): string {
-  return text.replace(WHITESPACE_RUN, ' ').trim().replace(MARKDOWN_SPECIAL, '\\$&')
-}
-
-/** The git author trailer's name, escaped, or {@link UNKNOWN_AUTHOR} if unusable. */
 function gitAuthorName(apiCommit: CommitPayload): string {
-  const name = neutralize(apiCommit.commit.author?.name ?? '')
-  return name === '' ? UNKNOWN_AUTHOR : name
+  const raw = apiCommit.commit.author?.name ?? ''
+  const name = stripMarkerShapedComments(raw.replace(WHITESPACE_RUN, ' ')).trim()
+  return name === '' ? UNKNOWN_AUTHOR : codeSpan(name)
 }
 
 /**
@@ -85,7 +110,7 @@ export function resolveMention(apiCommit: CommitPayload, mentions: MentionStyle)
     return gitAuthorName(apiCommit)
   }
 
-  // Classified on the raw login, emitted through `neutralize`. Doing it the
+  // Classified on the raw login, emitted through `neutralizeLogin`. Doing it the
   // other way round would compare against an escaped `\[bot\]`.
   const login = apiCommit.author?.login.trim() ?? ''
 
@@ -93,15 +118,15 @@ export function resolveMention(apiCommit: CommitPayload, mentions: MentionStyle)
     return gitAuthorName(apiCommit)
   }
   if (login.endsWith(BOT_LOGIN_SUFFIX)) {
-    // Escaped like any other plain text, which is what stops the `[bot]` suffix
-    // from binding to a reference link definition someone left in the body.
-    return neutralize(login)
+    // Escaped rather than wrapped, so it still reads as a name beside the plain
+    // `@mentions` around it. Safe to leave unwrapped: the dangerous sigils cannot
+    // occur in a login, and the brackets that CAN are escaped here.
+    return neutralizeLogin(login)
   }
   if (login === WEB_EDITOR_LOGIN) {
     return gitAuthorName(apiCommit)
   }
-  // Documented logins are alphanumeric plus `-`, so `neutralize` is a no-op on
-  // every real one. It runs anyway: this module's contract is that no API string
-  // reaches the body unescaped, and the `@` sigil below is ours, not theirs.
-  return `@${neutralize(login)}`
+  // The `@` sigil is ours, not theirs, and it has to stay live — this is the one
+  // field in the block that is meant to notify somebody.
+  return `@${neutralizeLogin(login)}`
 }

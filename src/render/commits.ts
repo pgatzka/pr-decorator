@@ -31,13 +31,14 @@
  *   place a timezone is ever applied (D8). A formatter here would be a second
  *   answer to the same question, and the goldens would stop proving anything.
  *
- * Mentions arrive already escaped from the author resolver and are emitted
- * verbatim — escaping them again renders a visible backslash. Subjects are the
+ * Mentions arrive already neutralized from the author resolver and are emitted
+ * verbatim — wrapping them again would nest a span inside a span. Subjects are the
  * opposite: they arrive raw, and neutralizing them is this module's job. Neither
- * side ever touches the other's output.
+ * side ever touches the other's output, and both reach for the same two primitives
+ * so the rule cannot drift into two versions.
  */
 
-import { START_MARKER } from '../body/markers'
+import { codeSpan, stripMarkerShapedComments } from '../markdown'
 import { formatInstant } from '../time'
 import type { RenderableCommit } from '../types'
 
@@ -92,84 +93,11 @@ const NO_COMMITS_LINE = 'No commits.'
  */
 const EMPTY_SUBJECT = '(no subject)'
 
-/**
- * `<!-- pr-decorator:` — the opening every marker shares, sliced off the real
- * marker rather than retyped. A typo in a retyped marker is the failure mode that
- * lets a crafted subject smuggle a genuine marker into the body, so the literal
- * has exactly one home and this is not it.
- */
-const MARKER_OPENING = START_MARKER.slice(0, START_MARKER.indexOf(':') + 1)
-
-/**
- * Any HTML comment of the marker shape, whether or not the name is one this action
- * knows — an unknown `<!-- pr-decorator:whatever -->` is still ours to strip.
- *
- * Non-greedy, so two markers in one subject do not swallow the text between them.
- * None of the opening's characters are regex metacharacters, which is why it is
- * used as pattern source verbatim.
- */
-const MARKER_SHAPED = new RegExp(`${MARKER_OPENING}.*?-->`, 'g')
-
-/**
- * Every run of backticks in a subject. The fence has to be longer than the longest
- * of them, otherwise the first run inside the subject closes the span early and the
- * rest of the bullet renders as markup again.
- *
- * Safe to reuse despite the `g` flag: `String.prototype.match` resets `lastIndex`
- * before it scans, so a previous call cannot make the next one start mid-string.
- */
-const BACKTICK_RUNS = /`+/g
-
 /** Line breaks that would end the bullet and let the rest render as new markup. */
 const LINE_BREAKS = /[\r\n]+/g
 
 /** Trailing slashes on the URL base, so a base with one does not produce `//`. */
 const TRAILING_SLASHES = /\/+$/
-
-/**
- * Removes every marker-shaped comment, repeatedly, until the text stops changing.
- *
- * One pass is not enough. `<!-- pr-<!-- pr-decorator:x -->decorator:skip -->`
- * strips its inner comment and what closes over the gap is a real skip marker —
- * removal that creates the thing being removed is the classic sanitizer bug. Each
- * pass strictly shortens the string, so the loop terminates.
- */
-function stripMarkers(text: string): string {
-  let current = text
-  for (;;) {
-    const stripped = current.replace(MARKER_SHAPED, '')
-    if (stripped === current) {
-      return current
-    }
-    current = stripped
-  }
-}
-
-/**
- * Wraps text in a code span that no content can escape from.
- *
- * Two rules from the GFM spec, both load-bearing rather than defensive:
- *
- * - The fence is one backtick longer than the longest run inside the content, so
- *   nothing in the subject can close the span early.
- * - When the content starts or ends with a backtick, a space goes on each side.
- *   The renderer strips one space from each end only when BOTH ends carry one, so
- *   padding both sides is what makes an edge backtick survive as visible text
- *   instead of merging into the fence.
- *
- * Content that is entirely whitespace would be destroyed by that stripping rule,
- * which is why the caller resolves the empty case before reaching here.
- */
-function codeSpan(content: string): string {
-  let longestRun = 0
-  for (const run of content.match(BACKTICK_RUNS) ?? []) {
-    longestRun = Math.max(longestRun, run.length)
-  }
-
-  const fence = '`'.repeat(longestRun + 1)
-  const padding = content.startsWith('`') || content.endsWith('`') ? ' ' : ''
-  return `${fence}${padding}${content}${padding}${fence}`
-}
 
 /**
  * Reduces a commit message to one safe, inert line (D7).
@@ -188,7 +116,7 @@ function codeSpan(content: string): string {
  */
 function neutralizeSubject(message: string): string {
   const firstLine = message.split('\n', 1)[0] ?? ''
-  const subject = stripMarkers(firstLine).replace(LINE_BREAKS, ' ').trim()
+  const subject = stripMarkerShapedComments(firstLine).replace(LINE_BREAKS, ' ').trim()
   return subject === '' ? EMPTY_SUBJECT : codeSpan(subject)
 }
 

@@ -43,7 +43,7 @@ const RULES: readonly Case[] = [
     rule: 'rule 1: mentions=name overrides a perfectly good login',
     commit: LINKED,
     mentions: 'name',
-    expected: 'Alice Liddell',
+    expected: '`Alice Liddell`',
   },
   {
     rule: 'rule 2: a [bot] login renders as plain text with the brackets escaped',
@@ -55,19 +55,19 @@ const RULES: readonly Case[] = [
     rule: 'rule 2 defers to rule 1: a bot commit with mentions=name uses the git name',
     commit: commitBy({ name: 'dependabot[bot]', login: 'dependabot[bot]' }),
     mentions: 'name',
-    expected: 'dependabot\\[bot\\]',
+    expected: '`dependabot[bot]`',
   },
   {
     rule: 'rule 3: web-flow falls back to the git author name',
     commit: commitBy({ name: 'Grace Hopper', login: 'web-flow' }),
     mentions: 'login',
-    expected: 'Grace Hopper',
+    expected: '`Grace Hopper`',
   },
   {
     rule: 'rule 4: an unmatched commit falls back to the git author name',
     commit: commitBy({ name: 'Ada Lovelace', login: null }),
     mentions: 'login',
-    expected: 'Ada Lovelace',
+    expected: '`Ada Lovelace`',
   },
   {
     rule: 'rule 6: an unmatched commit with a blank git name renders the literal',
@@ -114,7 +114,7 @@ describe('resolveMention', () => {
 
   it('treats an empty login as no account rather than rendering a bare @', () => {
     expect(resolveMention(commitBy({ name: 'Ada Lovelace', login: '' }), 'login')).toBe(
-      'Ada Lovelace',
+      '`Ada Lovelace`',
     )
   })
 
@@ -125,69 +125,89 @@ describe('resolveMention', () => {
   })
 })
 
-describe('git name escaping', () => {
+describe('git name neutralization', () => {
   /** Renders `name` as the git author of an unmatched commit. */
   function render(name: string): string {
     return resolveMention(commitBy({ name, login: null }), 'login')
   }
 
-  it('escapes the full attack name byte for byte', () => {
-    expect(render('@everyone *pwned* | x')).toBe('\\@everyone \\*pwned\\* \\| x')
+  it('wraps the full attack name rather than escaping it', () => {
+    // The escape this replaced was measured against live GitHub during #16 and
+    // did not stop the closing-keyword pass. A code span does, and it is the
+    // whole field that is wrapped, because that is the form the probe proved.
+    expect(render('@everyone *pwned* | x')).toBe('`@everyone *pwned* | x`')
   })
 
   it.each([
-    ['backslash', 'a\\b', 'a\\\\b'],
-    ['backtick', 'a`b', 'a\\`b'],
-    ['asterisk', 'a*b', 'a\\*b'],
-    ['underscore', 'a_b', 'a\\_b'],
-    ['open bracket', 'a[b', 'a\\[b'],
-    ['close bracket', 'a]b', 'a\\]b'],
-    ['less than', 'a<b', 'a\\<b'],
-    ['greater than', 'a>b', 'a\\>b'],
-    ['hash', 'a#b', 'a\\#b'],
-    ['at sign', 'a@b', 'a\\@b'],
-    ['pipe', 'a|b', 'a\\|b'],
-  ])('escapes a %s', (_label, name, expected) => {
-    expect(render(name)).toBe(expected)
+    ['backslash', 'a\\b'],
+    ['asterisk', 'a*b'],
+    ['underscore', 'a_b'],
+    ['open bracket', 'a[b'],
+    ['close bracket', 'a]b'],
+    ['less than', 'a<b'],
+    ['greater than', 'a>b'],
+    ['hash', 'a#b'],
+    ['at sign', 'a@b'],
+    ['pipe', 'a|b'],
+  ])('carries a %s through untouched, inert inside the span', (_label, name) => {
+    expect(render(name)).toBe('`' + name + '`')
   })
 
-  it('escapes each special character exactly once', () => {
-    // The escaper runs in a single pass, so the backslash it inserts is never
-    // fed back through the character class.
-    expect(render('##')).toBe('\\#\\#')
-    expect(render('\\@')).toBe('\\\\\\@')
+  it('adds no backslash of its own, for any input', () => {
+    // The regression this guards: an escape creeping back in alongside the
+    // wrapper would render a visible backslash, because inside a code span a
+    // backslash is a literal backslash.
+    expect(render('##')).toBe('`##`')
+    expect(render('\\@')).toBe('`\\@`')
+    expect(render('plain')).not.toContain('\\')
+  })
+
+  it('fences longer than any backtick run the name carries', () => {
+    expect(render('a`b')).toBe('``a`b``')
+    expect(render('`edge`')).toBe('`` `edge` ``')
   })
 
   it('defuses link and image syntax', () => {
-    expect(render('[link](x)')).toBe('\\[link\\](x)')
-    expect(render('![img](x)')).toBe('!\\[img\\](x)')
+    expect(render('[link](x)')).toBe('`[link](x)`')
+    expect(render('![img](x)')).toBe('`![img](x)`')
   })
 
   it('defuses a mention that would notify an entire team', () => {
     const rendered = render('@org/team')
-    expect(rendered).toBe('\\@org/team')
-    expect(rendered).not.toMatch(/(^|[^\\])@/)
+    expect(rendered).toBe('`@org/team`')
+    // The `@` survives as text, so the reader still sees what was written.
+    expect(rendered).toContain('@org/team')
   })
 
-  it('defuses an issue reference that would cross-link', () => {
-    expect(render('closes #12')).toBe('closes \\#12')
+  it('defuses an issue reference that would close an unrelated issue', () => {
+    expect(render('closes #12')).toBe('`closes #12`')
   })
 
-  it('breaks a literal managed-block marker', () => {
-    const rendered = render('<!-- pr-decorator:end -->')
-    expect(rendered).toBe('\\<!-- pr-decorator:end --\\>')
-    expect(rendered).not.toContain('<!-- pr-decorator:end -->')
+  it('removes a literal managed-block marker outright', () => {
+    // Wrapping is not enough here and never was: the block parser scans lines
+    // rather than rendering markdown, so a marker inside a code span would still
+    // terminate the block. It has to be gone, not merely inert.
+    expect(render('Ada <!-- pr-decorator:end --> Lovelace')).toBe('`Ada  Lovelace`')
+
+    const onlyMarker = render('<!-- pr-decorator:end -->')
+    expect(onlyMarker).toBe(UNKNOWN_AUTHOR)
+    expect(onlyMarker).not.toContain('pr-decorator')
   })
 
   it('collapses newlines so a name cannot inject a second bullet', () => {
-    expect(render('Alice\n- pwned')).toBe('Alice - pwned')
-    expect(render('Alice\r\nBob')).toBe('Alice Bob')
-    expect(render('  Alice   B  ')).toBe('Alice B')
+    expect(render('Alice\n- pwned')).toBe('`Alice - pwned`')
+    expect(render('Alice\r\nBob')).toBe('`Alice Bob`')
+    expect(render('  Alice   B  ')).toBe('`Alice B`')
   })
 
-  it('leaves ordinary names alone', () => {
-    expect(render('Ada Lovelace')).toBe('Ada Lovelace')
-    expect(render("Sinéad O'Brien-Ng")).toBe("Sinéad O'Brien-Ng")
+  it('leaves the unknown literal unwrapped, so a real "unknown" is distinguishable', () => {
+    expect(render('')).toBe(UNKNOWN_AUTHOR)
+    expect(render('unknown')).toBe('`unknown`')
+  })
+
+  it('leaves ordinary names readable', () => {
+    expect(render('Ada Lovelace')).toBe('`Ada Lovelace`')
+    expect(render("Sinead O'Brien-Ng")).toBe("`Sinead O'Brien-Ng`")
   })
 })
 
