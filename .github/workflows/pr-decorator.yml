@@ -1,0 +1,75 @@
+name: Decorate pull requests
+
+# This repository consumes its own action, so every claim the README makes is
+# observable on this repository's own pull requests.
+#
+# The trigger, permission and concurrency blocks below are the README's "Usage"
+# recipe verbatim. The job body is the one place it necessarily differs:
+# consumers pin `pgatzka/pr-decorator@v1` and need no working tree at all, while a
+# local `uses: ./` resolves `dist/index.js` out of the checkout. So this job
+# checks out and builds first. That is a property of running the action from
+# source, not a correction to the recipe.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+# The action reads the pull request and rewrites its body. Nothing else.
+permissions:
+  pull-requests: write
+
+# Rapid pushes queue several runs on the same pull request, and only the newest
+# can produce a correct block. Keyed on the pull request number so runs on
+# different pull requests never cancel each other.
+concurrency:
+  group: pr-decorator-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # FORK CAVEAT. A pull request opened from a fork runs with a read-only
+  # GITHUB_TOKEN regardless of the `permissions:` block above. The write comes
+  # back 403, the action warns and exits 0, and the run is GREEN with nothing
+  # written. A green run on a fork pull request is therefore NOT evidence that the
+  # writer works — the happy path is only observable on same-repo branches. The
+  # supported answer is `pull_request_target`, documented under "Decorating pull
+  # requests from forks" in the README and deliberately not enabled here.
+  #
+  # Which is also why this job must stay on `pull_request`: the steps below run
+  # `npm ci` and a build, i.e. they execute code from the head branch. Under
+  # `pull_request` that code holds a read-only fork token. Under
+  # `pull_request_target` it would hold this repository's write token.
+  decorate:
+    name: Write the summary block
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # Same major as `runs.using` in action.yml, as `engines.node` in
+      # package.json and as node-version in ci.yml. The bundle this job builds is
+      # the bundle it then executes, so a mismatched major would run the action on
+      # a runtime it is never released on.
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      # `npm ci` and the build MUST live in this job, not an earlier one: the
+      # workspace is not shared across jobs, so a build elsewhere leaves dist/
+      # missing at the moment `uses: ./` is resolved.
+      #
+      # dist/ is committed and gated for freshness by ci.yml, so rebuilding here is
+      # redundant on a green branch — but it is the rebuild that makes this
+      # workflow exercise the pull request's own source rather than whatever
+      # bundle happened to be committed.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the bundle
+        run: npm run package
+
+      - name: Decorate the pull request
+        uses: ./
+        with:
+          timezone: Europe/Berlin
