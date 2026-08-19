@@ -37564,7 +37564,7 @@ function resolveMention(apiCommit, mentions) {
 /**
  * The only module in the action that talks to the GitHub API.
  *
- * Two things are owned here and nowhere else:
+ * Three things are owned here and nowhere else:
  *
  * - **Bounding.** `GET /pulls/{n}/commits` serves at most 250 commits no matter
  *   how it is paged, so paging past that is pure rate-limit burn on a
@@ -37575,6 +37575,12 @@ function resolveMention(apiCommit, mentions) {
  *   the rendered list matches the pull request's own Commits tab. Nothing here
  *   sorts or reverses; author dates are not monotonic after a rebase and sorting
  *   by them would silently reorder the block.
+ * - **Swallowing the two survivable statuses on the issue-title read.** Unlike
+ *   every other call this module makes, `getIssueTitle` (#47) returns `null`
+ *   rather than throwing on a `403` or a `404` — the missing-permission case a
+ *   `title: true` consumer hits on its first run without `issues: read` granted
+ *   is common enough that the orchestrator should decide how loud to be about
+ *   it, not have the run fail underneath it.
  *
  * URLs are always built from the BASE repository. The head repository of a fork
  * pull request can be deleted, and every link into it dies with it, so head repo
@@ -37592,12 +37598,19 @@ const PER_PAGE = 100;
 /** Three pages of 100 cover the ceiling; a fourth request can never be useful. */
 const MAX_PAGES = Math.ceil(MAX_COMMITS / PER_PAGE);
 const PULL_REQUEST_ROUTE = '/repos/{owner}/{repo}/pulls/{pull_number}';
+/**
+ * Read against the BASE repository, consistent with every other route in this
+ * module — an issue linked from a fork's branch name is still the base
+ * repository's own issue.
+ */
+const ISSUE_ROUTE = '/repos/{owner}/{repo}/issues/{issue_number}';
 /** Verb used in the message of an error raised for each operation. */
 const DESCRIPTIONS = {
     getPullRequest: 'read pull request',
     listCommits: 'list the commits of pull request',
-    getBody: 're-read the body of pull request',
-    updateBody: 'update the body of pull request',
+    getWritableFields: 're-read the title and body of pull request',
+    getIssue: 'read issue',
+    updatePullRequest: 'update pull request',
 };
 /** Reads a numeric `status` off an unknown thrown value, Octokit's `RequestError`. */
 function statusOf(error) {
@@ -37635,12 +37648,19 @@ function classify(error, operation, target) {
  * count itself becomes assertable.
  */
 function createGitHubClientForRequest(request) {
-    async function send(operation, method, route, owner, repo, number, params = {}) {
+    /**
+     * `numberKey` is `pull_number` for every route this module called before
+     * #47 and `issue_number` for the one route added by it — Octokit's own
+     * request() fills a route's `{placeholder}`s from whichever params object
+     * key matches the placeholder's name, so the two routes need different keys
+     * even though both take a plain number.
+     */
+    async function send(operation, method, route, owner, repo, numberKey, number, params = {}) {
         try {
             const response = await request(`${method} ${route}`, {
                 owner,
                 repo,
-                pull_number: number,
+                [numberKey]: number,
                 ...params,
             });
             return response.data;
@@ -37650,7 +37670,7 @@ function createGitHubClientForRequest(request) {
         }
     }
     async function readPullRequest(operation, owner, repo, number) {
-        return send(operation, 'GET', PULL_REQUEST_ROUTE, owner, repo, number);
+        return send(operation, 'GET', PULL_REQUEST_ROUTE, owner, repo, 'pull_number', number);
     }
     return {
         async getPullRequest(owner, repo, number) {
@@ -37658,6 +37678,7 @@ function createGitHubClientForRequest(request) {
             return {
                 body: payload.body ?? '',
                 bodyWasAbsent: payload.body === null,
+                title: payload.title,
                 headRef: payload.head.ref,
                 headSha: payload.head.sha,
                 // Base, never head: a link into a deleted fork is a dead link.
@@ -37670,7 +37691,7 @@ function createGitHubClientForRequest(request) {
         async listCommits(owner, repo, number, totalCommits) {
             const collected = [];
             for (let page = 1; page <= MAX_PAGES; page += 1) {
-                const batch = await send('listCommits', 'GET', `${PULL_REQUEST_ROUTE}/commits`, owner, repo, number, { per_page: PER_PAGE, page });
+                const batch = await send('listCommits', 'GET', `${PULL_REQUEST_ROUTE}/commits`, owner, repo, 'pull_number', number, { per_page: PER_PAGE, page });
                 // Appended, never merged or sorted: API list order is the rendered order.
                 collected.push(...batch);
                 // A short page is the last page; reaching the ceiling makes the next one
@@ -37689,12 +37710,35 @@ function createGitHubClientForRequest(request) {
                 truncated: totalCommits > commits.length,
             };
         },
-        async getBody(owner, repo, number) {
-            const payload = await readPullRequest('getBody', owner, repo, number);
-            return payload.body ?? '';
+        async getIssueTitle(owner, repo, issueNumber) {
+            try {
+                const payload = await send('getIssue', 'GET', ISSUE_ROUTE, owner, repo, 'issue_number', issueNumber);
+                return payload.title;
+            }
+            catch (error) {
+                // A 403 and a 404 both mean "no title available" here (the latter is
+                // also what GitHub answers for an existing issue the token cannot see),
+                // and neither is this call's problem to raise: the orchestrator decides
+                // how loud to be about a missing `issues: read` permission. Everything
+                // else — a 5xx, a malformed response — classifies and throws as usual.
+                if (error instanceof PermissionDeniedError) {
+                    return null;
+                }
+                if (error instanceof GitHubApiError && error.status === 404) {
+                    return null;
+                }
+                throw error;
+            }
         },
-        async updateBody(owner, repo, number, body) {
-            await send('updateBody', 'PATCH', PULL_REQUEST_ROUTE, owner, repo, number, { body });
+        async getWritableFields(owner, repo, number) {
+            const payload = await readPullRequest('getWritableFields', owner, repo, number);
+            return { body: payload.body ?? '', title: payload.title };
+        },
+        async updatePullRequest(owner, repo, number, fields) {
+            if (fields.title === undefined && fields.body === undefined) {
+                return;
+            }
+            await send('updatePullRequest', 'PATCH', PULL_REQUEST_ROUTE, owner, repo, 'pull_number', number, fields);
         },
     };
 }
@@ -37998,7 +38042,7 @@ function capBranchName(name) {
     return name.length > MAX_BRANCH_NAME_LENGTH ? null : name;
 }
 /**
- * Parses and validates all eight inputs.
+ * Parses and validates all nine inputs.
  *
  * @returns The validated configuration. Every field is known-good; no caller
  *   re-validates.
@@ -38015,6 +38059,7 @@ function parseInputs() {
         branchPattern: parseBranchPattern(),
         footer: parseBoolean('footer', true),
         mentions: parseEnum('mentions', MENTION_STYLES, 'login'),
+        title: parseBoolean('title', true),
         dryRun: parseBoolean('dry-run', false),
     };
 }
@@ -38463,7 +38508,9 @@ function renderFooter(options) {
 
 ;// CONCATENATED MODULE: ./src/render/issue-ref.ts
 /**
- * The closing reference line — the first line of the managed block.
+ * The closing reference line — the first line of the managed block — and the
+ * issue-number derivation both the closing reference and the pull request
+ * title (#47) are built on.
  *
  * The issue number comes from the head branch name alone: no API call is made,
  * and nothing here checks that the issue exists or is open. That is deliberate.
@@ -38509,21 +38556,24 @@ function matchOnce(branchName, pattern) {
     return new RegExp(pattern.source, pattern.flags).exec(branchName);
 }
 /**
- * Renders the `Closes #<n>` line for a head branch, or nothing at all.
+ * Resolves the issue number captured from a head branch name, or `null`.
  *
- * The branch name is only ever the subject of the match, never part of the
- * pattern, so a branch called `fix/(.*)+` is data like any other name.
+ * Extracted out of {@link renderIssueReference} so the pull request title
+ * (#47) can share the exact same derivation as the closing reference: the
+ * issue number comes from one place, and the closing line and the title read
+ * it from there rather than each running their own copy of these rules.
  *
  * @param branchName - The head branch name, e.g. `142-fix-auth`. The caller has
  *   already applied the length cap from the input parser.
  * @param pattern - The compiled `branch-pattern`; capture group 1 is the issue
  *   number. Only the first group is read, so `^(?:feature|fix)\/(\d+)-` works
  *   unchanged. Not mutated.
- * @returns Exactly `Closes #<n>`, or `null` when the pattern does not match, the
- *   first group is absent or empty, the capture is not a run of ASCII digits, or
- *   the number is zero — there is no issue #0.
+ * @returns The issue number as a string — never parsed to a JS number, so an
+ *   issue past 2^53 is not rounded — or `null` when the pattern does not
+ *   match, the first group is absent or empty, the capture is not a run of
+ *   ASCII digits, or the number is zero — there is no issue #0.
  */
-function renderIssueReference(branchName, pattern) {
+function resolveIssueNumber(branchName, pattern) {
     const match = matchOnce(branchName, pattern);
     if (match === null) {
         return null;
@@ -38537,10 +38587,108 @@ function renderIssueReference(branchName, pattern) {
     // 2^53 into a different issue. An all-zeros capture strips to '' and is
     // rejected here, which is also how `0-nope` is refused.
     const number = captured.replace(LEADING_ZEROS, '');
-    if (number === '') {
+    return number === '' ? null : number;
+}
+/**
+ * Renders the `Closes #<n>` line for a head branch, or nothing at all.
+ *
+ * The branch name is only ever the subject of the match, never part of the
+ * pattern, so a branch called `fix/(.*)+` is data like any other name.
+ *
+ * A thin wrapper over {@link resolveIssueNumber}: this function owns nothing
+ * but the `Closes #<n>` spelling.
+ *
+ * @param branchName - The head branch name, e.g. `142-fix-auth`. The caller has
+ *   already applied the length cap from the input parser.
+ * @param pattern - The compiled `branch-pattern`; capture group 1 is the issue
+ *   number. Only the first group is read, so `^(?:feature|fix)\/(\d+)-` works
+ *   unchanged. Not mutated.
+ * @returns Exactly `Closes #<n>`, or `null` when {@link resolveIssueNumber}
+ *   returns `null`.
+ */
+function renderIssueReference(branchName, pattern) {
+    const number = resolveIssueNumber(branchName, pattern);
+    return number === null ? null : `${CLOSING_KEYWORD} #${number}`;
+}
+
+;// CONCATENATED MODULE: ./src/render/title.ts
+/**
+ * The pull request title: `#<issueId> <issue title, lowercased>`.
+ *
+ * Pure, like the rest of `src/render/**`: nothing from the actions toolkit and
+ * nothing from the GitHub client layer, enforced by the same eslint layering
+ * rule that guards `src/render/issue-ref.ts`. The caller resolves the issue
+ * number (via `resolveIssueNumber` in `issue-ref.ts`) and reads the issue title
+ * from the API; this module only shapes the string.
+ *
+ * That is also why the prose below never spells those import paths — or the
+ * locale-sensitive casing call — out literally. `test/render/title.test.ts`
+ * asserts over this file's raw source text, where a mention inside a comment
+ * reads exactly like the real thing.
+ *
+ * The title has no delimiter the way the body has markers. When the title
+ * feature is on, this string fully replaces whatever the pull request author
+ * typed, on every run — there is no non-destructive middle ground for a
+ * single-line field, unlike the marker-bounded body.
+ */
+/**
+ * GitHub's own limit on an issue/pull request title, in UTF-16 code units.
+ * Measured against `PATCH /repos/{owner}/{repo}/pulls/{pull_number}`: a title
+ * longer than this is rejected with a 422 Validation Failed whose error body
+ * reads `title is too long (maximum is 256 characters)`.
+ */
+const MAX_TITLE_LENGTH = 256;
+/** Appended in place of the characters a truncated title drops. */
+const ELLIPSIS = '…';
+/** A run of whitespace or a C0/C1 control character (CR, LF, TAB included). */
+const WHITESPACE_OR_CONTROL = /[\s\p{Cc}]+/gu;
+/**
+ * Collapses every run of whitespace and control characters to a single space
+ * and trims the result. An issue title can carry a newline or a stray tab in
+ * ways the API accepts and are not worth discovering in a pull request title.
+ */
+function normalize(issueTitle) {
+    return issueTitle.replace(WHITESPACE_OR_CONTROL, ' ').trim();
+}
+/**
+ * Renders the pull request title for `issueNumber` and `issueTitle`.
+ *
+ * Only the issue title is cased, and always with
+ * `String.prototype.toLowerCase()` — never its locale-sensitive counterpart.
+ * That one follows the runtime's default locale, and under a Turkish one `I`
+ * maps to the dotless `ı`: the same issue would then render a different title
+ * depending on which runner happened to pick up the job. `toLowerCase()` has no
+ * such dependency. The `#<n>` prefix is not text to case at all and is emitted
+ * verbatim.
+ *
+ * @param issueNumber - The issue number as a string, exactly as
+ *   `resolveIssueNumber` in `issue-ref.ts` returns it — never rounded, so an
+ *   issue number past 2^53 renders correctly.
+ * @param issueTitle - The issue's own title, exactly as the API served it.
+ * @returns `#<issueNumber> <issueTitle, lowercased>`, truncated to
+ *   {@link MAX_TITLE_LENGTH} with a trailing `…` when it would otherwise
+ *   exceed it — the `#<n>` prefix always survives intact; only the issue
+ *   title is ever cut — or `null` when the normalized issue title is empty.
+ *   A bare `#142` as a title is worse than leaving the author's title alone.
+ */
+function renderTitle(issueNumber, issueTitle) {
+    const normalized = normalize(issueTitle);
+    if (normalized === '') {
         return null;
     }
-    return `${CLOSING_KEYWORD} #${number}`;
+    const prefix = `#${issueNumber} `;
+    const lowered = normalized.toLowerCase();
+    const budget = MAX_TITLE_LENGTH - prefix.length;
+    if (lowered.length <= budget) {
+        return `${prefix}${lowered}`;
+    }
+    if (budget <= ELLIPSIS.length) {
+        // The prefix alone leaves no room for any issue title text, not even the
+        // ellipsis alone. Not reachable with any realistic issue number, but the
+        // result stays bounded at MAX_TITLE_LENGTH rather than overrunning it.
+        return prefix.slice(0, MAX_TITLE_LENGTH);
+    }
+    return `${prefix}${lowered.slice(0, budget - ELLIPSIS.length)}${ELLIPSIS}`;
 }
 
 ;// CONCATENATED MODULE: ./src/render/truncate.ts
@@ -38635,12 +38783,12 @@ function truncateCommits(commits, budget, measure) {
  *   base and turning the API's author date into an instant all need to see both the
  *   API payload and the render layer, and this is the only place that does. They are
  *   defined once here so the goldens have exactly one thing to agree with.
- * - **The byte-identical write skip (D5).** A pull request whose body already says
- *   what this run would say is not written to. That is what stops the action from
- *   retriggering itself, and it is deliberately the ONLY loop guard — no actor
- *   check, no bot-name check, nothing that a self-hosted or renamed bot identity
- *   could defeat. Placed here rather than in the guard module per D9: whether a
- *   write is worth making is orchestration, not permission.
+ * - **The byte-identical write skip (D5).** A pull request whose body and title
+ *   already say what this run would say is not written to. That is what stops the
+ *   action from retriggering itself, and it is deliberately the ONLY loop guard —
+ *   no actor check, no bot-name check, nothing that a self-hosted or renamed bot
+ *   identity could defeat. Placed here rather than in the guard module per D9:
+ *   whether a write is worth making is orchestration, not permission.
  * - **The severity mapping.** `fatal` fails the run, `warning` and `notice` do not,
  *   and no other module in the action calls `core.setFailed`. A test greps `src/`
  *   to keep it that way.
@@ -38649,7 +38797,15 @@ function truncateCommits(commits, budget, measure) {
  * whose end marker was edited away, a body too long for the block to fit in, and a
  * token that was not allowed to write. Only the last of those is an error at all,
  * and none of them is the consumer's mistake to fix under a red X.
+ *
+ * The title (#47) rides along with the body rather than beside it: one pull
+ * request read resolves the issue number both features share, one guarded
+ * callback re-reads both current fields immediately before writing, and one
+ * `PATCH` carries whichever of the two actually changed. A title that cannot be
+ * resolved — the branch does not match, the issue read is denied, the issue title
+ * is empty — never blocks the body; it only ever narrows what gets written.
  */
+
 
 
 
@@ -38791,25 +38947,93 @@ function resolveTarget() {
     return { owner, repo, number: pullRequest.number };
 }
 /**
- * The `Closes #<n>` line for this pull request, or `null` for no line at all.
+ * The head branch name, capped and ready to match against `branch-pattern`, or
+ * `null` for "there is nothing to match" — shared by the closing reference and
+ * the title (#47) so a run where both are on caps the branch name once and logs
+ * the over-long notice once, not twice.
  *
- * Three different causes collapse into that one `null`, and the assembler treats
- * them identically: the line is turned off, the branch name is too long to match
- * safely, or the pattern simply does not match. Only the middle one is worth a log
- * line, because it is the one a reader would otherwise be unable to explain.
+ * Skipped entirely when neither feature that reads it is on, so a run with
+ * `issue-link: false` and `title: false` never even caps the branch name.
  */
-function renderClosingReference(headRef, inputs) {
-    if (!inputs.issueLink) {
+function resolveIssueBranchName(headRef, inputs) {
+    if (!inputs.issueLink && !inputs.title) {
         return null;
     }
     const branchName = capBranchName(headRef);
     if (branchName === null) {
         notice(`The head branch name is longer than ${MAX_BRANCH_NAME_LENGTH} characters, so it was not ` +
-            'matched against `branch-pattern` and no closing reference was rendered. The cap bounds ' +
-            'the cost of a catastrophically backtracking pattern; the rest of the block is unaffected.');
+            'matched against `branch-pattern`; neither a closing reference nor a title was resolved. ' +
+            'The cap bounds the cost of a catastrophically backtracking pattern; the rest of the block ' +
+            'is unaffected.');
+        return null;
+    }
+    return branchName;
+}
+/**
+ * The `Closes #<n>` line for this pull request, or `null` for no line at all.
+ *
+ * Three different causes collapse into that one `null`, and the assembler treats
+ * them identically: the line is turned off, the branch name is too long to match
+ * safely, or the pattern simply does not match. Only the over-long branch is
+ * worth a log line — logged once by {@link resolveIssueBranchName} — because it
+ * is the one a reader would otherwise be unable to explain. A branch that simply
+ * does not match `branch-pattern` is the ordinary case for any pull request not
+ * opened from an issue-numbered branch, so it stays silent.
+ */
+function renderClosingReference(branchName, inputs) {
+    if (!inputs.issueLink || branchName === null) {
         return null;
     }
     return renderIssueReference(branchName, inputs.branchPattern);
+}
+/**
+ * The pull request title for this run, or `null` for "leave it alone".
+ *
+ * Every cause that yields `null` past the `title: false` check is logged once,
+ * right here, because each is a different explanation a reader could not
+ * otherwise reconstruct: the branch did not match `branch-pattern`, the issue
+ * title could not be read, or the issue title normalized to nothing. None of
+ * them is fatal — the body decoration proceeds exactly the same either way,
+ * which is what makes the title strictly additive rather than a second thing
+ * that can fail the run.
+ *
+ * Deliberately louder than {@link renderClosingReference} about a branch that
+ * simply does not match: the closing reference is one line among several and a
+ * missing one is easy to miss, but a title left exactly as the author typed it
+ * is something they see every time they look at the pull request, so the run
+ * says why.
+ */
+async function resolveTitle(client, inputs, target, branchName) {
+    if (!inputs.title) {
+        return null;
+    }
+    const { owner, repo, number } = target;
+    if (branchName === null) {
+        // Either the branch name was too long — resolveIssueBranchName() already
+        // logged that — or issue-link and title are both off, which is
+        // unreachable here since title is on.
+        return null;
+    }
+    const issueNumber = resolveIssueNumber(branchName, inputs.branchPattern);
+    if (issueNumber === null) {
+        notice(`The head branch name of ${owner}/${repo}#${number} did not match \`branch-pattern\`, so no ` +
+            'issue number was resolved and the pull request title was left untouched.');
+        return null;
+    }
+    const issueTitle = await client.getIssueTitle(owner, repo, issueNumber);
+    if (issueTitle === null) {
+        warning(`Could not read the title of issue #${issueNumber} to set the title of ${owner}/${repo}#${number}. ` +
+            'The usual cause is that the token was not granted `issues: read` — add it to the ' +
+            "workflow's `permissions:` block, next to `pull-requests: write`. The pull request title " +
+            'was left untouched; the body was still decorated.');
+        return null;
+    }
+    const rendered = renderTitle(issueNumber, issueTitle);
+    if (rendered === null) {
+        notice(`Issue #${issueNumber} linked from ${owner}/${repo}#${number} has an empty title once ` +
+            'normalized, so the pull request title was left untouched rather than set to a bare `#<n>`.');
+    }
+    return rendered;
 }
 /**
  * Renders the block and decides whether it is written.
@@ -38834,7 +39058,9 @@ async function main_decorate(client, inputs, target) {
         commitUrlBase: commitUrlBase(pullRequest),
     };
     const commits = commitList.commits.map((payload) => toRenderableCommit(payload, inputs.mentions));
-    const closingReference = renderClosingReference(pullRequest.headRef, inputs);
+    const branchName = resolveIssueBranchName(pullRequest.headRef, inputs);
+    const closingReference = renderClosingReference(branchName, inputs);
+    const desiredTitle = await resolveTitle(client, inputs, target, branchName);
     const footer = inputs.footer
         ? renderFooter({
             headShortSha: abbreviate(pullRequest.headSha),
@@ -38881,42 +39107,61 @@ async function main_decorate(client, inputs, target) {
             `this run would have placed (${block.renderedCommits} commits shown, ` +
             `${block.omittedCommits} omitted):`);
         info(block.text);
+        // Logged whether or not it differs from the current title — dry-run reports
+        // what this run WOULD set, and "already correct" is a legitimate answer to
+        // that question, not a reason to stay silent.
+        if (desiredTitle !== null) {
+            info(`dry-run: the title of ${owner}/${repo}#${number} would be set to \`${desiredTitle}\`.`);
+        }
         return;
     }
-    await write(client, inputs, target, block.text);
+    await write(client, inputs, target, block.text, desiredTitle);
 }
 /**
  * Performs the write, under the guard and behind the two skips.
  *
- * The body is re-read INSIDE the guarded callback rather than before it. There is no
- * `If-Match` on this endpoint and the whole body is replaced, so the only mitigation
- * against clobbering an edit made while the block was being rendered is to read
- * again at the last possible moment — and that read is refused by exactly the same
- * token, for exactly the same reason, as the write it precedes.
+ * The title and body are re-read INSIDE the guarded callback rather than before
+ * it. There is no `If-Match` on this endpoint and each field named on the `PATCH`
+ * is replaced whole, so the only mitigation against clobbering an edit made while
+ * the block was being rendered is to read both again at the last possible
+ * moment — and that read is refused by exactly the same token, for exactly the
+ * same reason, as the write it precedes.
  */
-async function write(client, inputs, target, block) {
+async function write(client, inputs, target, block, desiredTitle) {
     const { owner, repo, number } = target;
     // Written from inside the guarded callback and read once it has returned. A
     // holder rather than a bare `let`, because a value assigned only inside a
     // callback is one the compiler cannot see being assigned.
     const attempt = { decision: 'updated' };
     const outcome = await guardedWrite(async () => {
-        const currentBody = await client.getBody(owner, repo, number);
-        const upsert = upsertBlock(currentBody, block, inputs.position);
+        const current = await client.getWritableFields(owner, repo, number);
+        const upsert = upsertBlock(current.body, block, inputs.position);
         // A start marker with no end after it: the body is in a state nothing can edit
-        // safely, so it is not edited. Checked before the comparison below, which would
-        // otherwise swallow it — the unchanged body is exactly what `unclosed` returns.
+        // safely, so it is not edited — and the title is left alone right along with
+        // it, because a pull request half-managed by this run is worse than one this
+        // run declined to touch at all. Checked before the comparison below, which
+        // would otherwise swallow it — the unchanged body is exactly what `unclosed`
+        // returns.
         if (upsert.action === 'unclosed') {
             attempt.decision = 'unclosed';
             return;
         }
-        // The byte-identical skip (D5). A body that already says what this run would say
-        // is not written to, which is what keeps the action from retriggering itself.
-        if (upsert.body === currentBody) {
+        // The byte-identical skip (D5), extended to the second field: only a field
+        // that actually differs from its current value is sent, and a `PATCH` with
+        // neither field is not sent at all. That is what keeps a rerun of this
+        // action from retriggering itself over a title it already set correctly.
+        const fields = {};
+        if (upsert.body !== current.body) {
+            fields.body = upsert.body;
+        }
+        if (desiredTitle !== null && desiredTitle !== current.title) {
+            fields.title = desiredTitle;
+        }
+        if (Object.keys(fields).length === 0) {
             attempt.decision = 'unchanged';
             return;
         }
-        await client.updateBody(owner, repo, number, upsert.body);
+        await client.updatePullRequest(owner, repo, number, fields);
     });
     if (outcome.status === 'skipped') {
         // Reported at the severity the guard read off the error, not at one assumed
@@ -38931,11 +39176,11 @@ async function write(client, inputs, target, block) {
                 'the body unrepairable. Restore or remove the stray marker line.');
             return;
         case 'unchanged':
-            notice(`The body of ${owner}/${repo}#${number} already matches what this run would write, so ` +
-                'no request was made.');
+            notice(`${owner}/${repo}#${number} already matches what this run would write, so no request ` +
+                'was made.');
             return;
         case 'updated':
-            info(`Updated the body of ${owner}/${repo}#${number}.`);
+            info(`Updated ${owner}/${repo}#${number}.`);
             return;
     }
 }

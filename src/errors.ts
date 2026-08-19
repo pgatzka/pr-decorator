@@ -20,7 +20,12 @@ export class DecoratorError extends Error {
  * Which client call failed. Machine-readable on purpose: the caller has to tell a
  * failed read from a failed write without parsing a message.
  */
-export type GitHubOperation = 'getPullRequest' | 'listCommits' | 'getBody' | 'updateBody'
+export type GitHubOperation =
+  | 'getPullRequest'
+  | 'listCommits'
+  | 'getWritableFields'
+  | 'getIssue'
+  | 'updatePullRequest'
 
 /**
  * A GitHub API call that came back with an HTTP status the action cannot work

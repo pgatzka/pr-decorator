@@ -1,7 +1,7 @@
 /**
  * The only module in the action that talks to the GitHub API.
  *
- * Two things are owned here and nowhere else:
+ * Three things are owned here and nowhere else:
  *
  * - **Bounding.** `GET /pulls/{n}/commits` serves at most 250 commits no matter
  *   how it is paged, so paging past that is pure rate-limit burn on a
@@ -12,6 +12,12 @@
  *   the rendered list matches the pull request's own Commits tab. Nothing here
  *   sorts or reverses; author dates are not monotonic after a rebase and sorting
  *   by them would silently reorder the block.
+ * - **Swallowing the two survivable statuses on the issue-title read.** Unlike
+ *   every other call this module makes, `getIssueTitle` (#47) returns `null`
+ *   rather than throwing on a `403` or a `404` — the missing-permission case a
+ *   `title: true` consumer hits on its first run without `issues: read` granted
+ *   is common enough that the orchestrator should decide how loud to be about
+ *   it, not have the run fail underneath it.
  *
  * URLs are always built from the BASE repository. The head repository of a fork
  * pull request can be deleted, and every link into it dies with it, so head repo
@@ -35,6 +41,13 @@ const PER_PAGE = 100
 const MAX_PAGES = Math.ceil(MAX_COMMITS / PER_PAGE)
 
 const PULL_REQUEST_ROUTE = '/repos/{owner}/{repo}/pulls/{pull_number}'
+
+/**
+ * Read against the BASE repository, consistent with every other route in this
+ * module — an issue linked from a fork's branch name is still the base
+ * repository's own issue.
+ */
+const ISSUE_ROUTE = '/repos/{owner}/{repo}/issues/{issue_number}'
 
 /**
  * A single commit as the commits endpoint serves it, reduced to the fields the
@@ -70,6 +83,8 @@ export interface PullRequestSummary {
    * log.
    */
   bodyWasAbsent: boolean
+  /** The pull request's current title, exactly as the API served it. */
+  title: string
   /** The head branch name, matched against `branch-pattern` for the issue number. */
   headRef: string
   /** The head commit SHA. */
@@ -80,6 +95,18 @@ export interface PullRequestSummary {
   baseRepo: string
   /** The authoritative commit count, which may exceed {@link MAX_COMMITS}. */
   totalCommits: number
+}
+
+/**
+ * The two fields a write can change, re-read as a pair immediately before
+ * writing (#47). Named after the parameter shape of
+ * {@link GitHubClient.updatePullRequest}, which it mirrors.
+ */
+export interface WritableFields {
+  /** The current body. */
+  body: string
+  /** The current title. */
+  title: string
 }
 
 /** The bounded commit list plus the counts needed to render the truncation note. */
@@ -113,15 +140,40 @@ export interface GitHubClient {
     totalCommits: number,
   ): Promise<CommitList>
   /**
-   * Re-reads just the current body.
+   * Reads the title of an issue in the BASE repository, or `null`.
    *
-   * `updateBody` replaces the whole body and the endpoint offers no `If-Match`, so
-   * the only mitigation against clobbering an edit made since the first read is to
-   * read again immediately before writing.
+   * `null` covers both a `404` (no such issue, or `issues: read` not granted —
+   * GitHub answers 404 for both) and a `403`. Every other status classifies and
+   * throws as it does everywhere else in this module: this is the one call the
+   * orchestrator is allowed to treat as "no title available" rather than as a
+   * failure, because a `title: true` consumer that has not yet added
+   * `issues: read` to its workflow must not go red over it.
    */
-  getBody(owner: string, repo: string, number: number): Promise<string>
-  /** Replaces the pull request body with `body`. */
-  updateBody(owner: string, repo: string, number: number, body: string): Promise<void>
+  getIssueTitle(owner: string, repo: string, issueNumber: string): Promise<string | null>
+  /**
+   * Re-reads the title and body together, immediately before writing.
+   *
+   * `updatePullRequest` replaces whichever of the two fields it is given and the
+   * endpoint offers no `If-Match`, so the only mitigation against clobbering an
+   * edit made since the first read is to read both again at the last possible
+   * moment — the same reason the body alone was re-read before this pair existed.
+   */
+  getWritableFields(owner: string, repo: string, number: number): Promise<WritableFields>
+  /**
+   * Updates the pull request with `fields`, sending exactly one `PATCH` carrying
+   * only the fields present on it.
+   *
+   * Makes no request at all when `fields` is empty — the caller is expected to
+   * pass only what actually changed, so an empty object means nothing changed.
+   * Title and body are written in that one request or not at all: two requests
+   * would double the retrigger surface a PAT-driven workflow has to survive.
+   */
+  updatePullRequest(
+    owner: string,
+    repo: string,
+    number: number,
+    fields: { title?: string; body?: string },
+  ): Promise<void>
 }
 
 /**
@@ -136,17 +188,24 @@ export interface OctokitRequest {
 /** What `GET /pulls/{n}` is read for. */
 interface PullRequestPayload {
   body: string | null
+  title: string
   head: { ref: string; sha: string }
   base: { repo: { owner: { login: string }; name: string } }
   commits: number
+}
+
+/** What `GET /issues/{n}` is read for. */
+interface IssuePayload {
+  title: string
 }
 
 /** Verb used in the message of an error raised for each operation. */
 const DESCRIPTIONS: Record<GitHubOperation, string> = {
   getPullRequest: 'read pull request',
   listCommits: 'list the commits of pull request',
-  getBody: 're-read the body of pull request',
-  updateBody: 'update the body of pull request',
+  getWritableFields: 're-read the title and body of pull request',
+  getIssue: 'read issue',
+  updatePullRequest: 'update pull request',
 }
 
 /** Reads a numeric `status` off an unknown thrown value, Octokit's `RequestError`. */
@@ -202,20 +261,28 @@ function classify(
  * count itself becomes assertable.
  */
 export function createGitHubClientForRequest(request: OctokitRequest): GitHubClient {
+  /**
+   * `numberKey` is `pull_number` for every route this module called before
+   * #47 and `issue_number` for the one route added by it — Octokit's own
+   * request() fills a route's `{placeholder}`s from whichever params object
+   * key matches the placeholder's name, so the two routes need different keys
+   * even though both take a plain number.
+   */
   async function send<T>(
     operation: GitHubOperation,
     method: string,
     route: string,
     owner: string,
     repo: string,
-    number: number,
+    numberKey: 'pull_number' | 'issue_number',
+    number: number | string,
     params: Record<string, unknown> = {},
   ): Promise<T> {
     try {
       const response = await request(`${method} ${route}`, {
         owner,
         repo,
-        pull_number: number,
+        [numberKey]: number,
         ...params,
       })
       return response.data as T
@@ -230,7 +297,15 @@ export function createGitHubClientForRequest(request: OctokitRequest): GitHubCli
     repo: string,
     number: number,
   ): Promise<PullRequestPayload> {
-    return send<PullRequestPayload>(operation, 'GET', PULL_REQUEST_ROUTE, owner, repo, number)
+    return send<PullRequestPayload>(
+      operation,
+      'GET',
+      PULL_REQUEST_ROUTE,
+      owner,
+      repo,
+      'pull_number',
+      number,
+    )
   }
 
   return {
@@ -239,6 +314,7 @@ export function createGitHubClientForRequest(request: OctokitRequest): GitHubCli
       return {
         body: payload.body ?? '',
         bodyWasAbsent: payload.body === null,
+        title: payload.title,
         headRef: payload.head.ref,
         headSha: payload.head.sha,
         // Base, never head: a link into a deleted fork is a dead link.
@@ -259,6 +335,7 @@ export function createGitHubClientForRequest(request: OctokitRequest): GitHubCli
           `${PULL_REQUEST_ROUTE}/commits`,
           owner,
           repo,
+          'pull_number',
           number,
           { per_page: PER_PAGE, page },
         )
@@ -284,13 +361,53 @@ export function createGitHubClientForRequest(request: OctokitRequest): GitHubCli
       }
     },
 
-    async getBody(owner, repo, number) {
-      const payload = await readPullRequest('getBody', owner, repo, number)
-      return payload.body ?? ''
+    async getIssueTitle(owner, repo, issueNumber) {
+      try {
+        const payload = await send<IssuePayload>(
+          'getIssue',
+          'GET',
+          ISSUE_ROUTE,
+          owner,
+          repo,
+          'issue_number',
+          issueNumber,
+        )
+        return payload.title
+      } catch (error) {
+        // A 403 and a 404 both mean "no title available" here (the latter is
+        // also what GitHub answers for an existing issue the token cannot see),
+        // and neither is this call's problem to raise: the orchestrator decides
+        // how loud to be about a missing `issues: read` permission. Everything
+        // else — a 5xx, a malformed response — classifies and throws as usual.
+        if (error instanceof PermissionDeniedError) {
+          return null
+        }
+        if (error instanceof GitHubApiError && error.status === 404) {
+          return null
+        }
+        throw error
+      }
     },
 
-    async updateBody(owner, repo, number, body) {
-      await send<unknown>('updateBody', 'PATCH', PULL_REQUEST_ROUTE, owner, repo, number, { body })
+    async getWritableFields(owner, repo, number) {
+      const payload = await readPullRequest('getWritableFields', owner, repo, number)
+      return { body: payload.body ?? '', title: payload.title }
+    },
+
+    async updatePullRequest(owner, repo, number, fields) {
+      if (fields.title === undefined && fields.body === undefined) {
+        return
+      }
+      await send<unknown>(
+        'updatePullRequest',
+        'PATCH',
+        PULL_REQUEST_ROUTE,
+        owner,
+        repo,
+        'pull_number',
+        number,
+        fields,
+      )
     },
   }
 }

@@ -58,6 +58,7 @@ const MAIN_SOURCE = readFileSync(fileURLToPath(new URL('../src/main.ts', import.
 const PULL_ROUTE = 'GET /repos/{owner}/{repo}/pulls/{pull_number}'
 const COMMITS_ROUTE = 'GET /repos/{owner}/{repo}/pulls/{pull_number}/commits'
 const PATCH_ROUTE = 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}'
+const ISSUE_ROUTE = 'GET /repos/{owner}/{repo}/issues/{issue_number}'
 
 const PULL_NUMBER = 42
 const HEAD_SHA = '9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d'
@@ -69,6 +70,8 @@ const UNCLOSED = 'unclosed' satisfies UpsertAction
 /** Mutable API state; `install` closes over it, so a scenario can edit it mid-run. */
 interface Api {
   body: string | null
+  /** The pull request's current title, re-read alongside the body before a write. */
+  title: string
   commits: RawCommit[]
   /** `null` means "as many as were served" — the ordinary case. */
   totalCommits: number | null
@@ -76,6 +79,10 @@ interface Api {
   headSha: string
   baseOwner: string
   baseRepo: string
+  /** The issue title `GET /issues/{n}` serves, when `issueReadStatus` is `null`. */
+  issueTitle: string
+  /** HTTP status to reject the issue-title read with, or `null` to let it through. */
+  issueReadStatus: number | null
   /** HTTP status to reject a `PATCH` with, or `null` to let it through. */
   patchStatus: number | null
   /** HTTP status to reject the pre-write re-read with. */
@@ -85,12 +92,15 @@ interface Api {
 function api(overrides: Partial<Api> = {}): Api {
   return {
     body: AUTHOR_TEXT,
+    title: 'A title the author wrote',
     commits: nonMonotonicRawCommits,
     totalCommits: null,
     headRef: '42-add-the-parser',
     headSha: HEAD_SHA,
     baseOwner: 'pgatzka',
     baseRepo: 'pr-decorator',
+    issueTitle: 'Add the parser',
+    issueReadStatus: null,
     patchStatus: null,
     rereadStatus: null,
     ...overrides,
@@ -119,7 +129,14 @@ function install(state: Api): void {
       if (state.patchStatus !== null) {
         return Promise.reject(httpError(state.patchStatus))
       }
-      state.body = String(params.body)
+      // Only the fields actually sent are applied, mirroring updatePullRequest's
+      // own contract: a field absent from `fields` is a field left untouched.
+      if (params.body !== undefined) {
+        state.body = String(params.body)
+      }
+      if (params.title !== undefined) {
+        state.title = String(params.title)
+      }
       return Promise.resolve({ data: {} })
     }
 
@@ -127,6 +144,13 @@ function install(state: Api): void {
       const perPage = Number(params.per_page)
       const offset = (Number(params.page) - 1) * perPage
       return Promise.resolve({ data: state.commits.slice(offset, offset + perPage) })
+    }
+
+    if (route === ISSUE_ROUTE) {
+      if (state.issueReadStatus !== null) {
+        return Promise.reject(httpError(state.issueReadStatus))
+      }
+      return Promise.resolve({ data: { title: state.issueTitle } })
     }
 
     if (route === PULL_ROUTE) {
@@ -139,6 +163,7 @@ function install(state: Api): void {
       return Promise.resolve({
         data: {
           body: state.body,
+          title: state.title,
           head: { ref: state.headRef, sha: state.headSha },
           base: { repo: { owner: { login: state.baseOwner }, name: state.baseRepo } },
           commits: state.totalCommits ?? state.commits.length,
@@ -181,6 +206,11 @@ function writtenBody(state: Api): string {
   return state.body ?? ''
 }
 
+/** The title as it stands after the run — unchanged unless a `PATCH` went through. */
+function writtenTitle(state: Api): string {
+  return state.title
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   for (const key of Object.keys(process.env)) {
@@ -188,7 +218,15 @@ beforeEach(() => {
       delete process.env[key]
     }
   }
-  setInputs()
+  // `title` defaults off here even though it defaults ON in production
+  // (action.yml, and `describe('(j) the title', ...)` below covers that true
+  // default explicitly): api()'s default headRef `42-add-the-parser` matches
+  // the default branch-pattern, so leaving title on here would make nearly
+  // every pre-existing scenario in this file also exercise the issue-title
+  // read. Sections (a)-(i) are about body/write orchestration and are
+  // unaffected either way; keeping title off keeps them exactly as they were
+  // before #47.
+  setInputs({ title: 'false' })
   mocked.context.serverUrl = 'https://github.com'
   mocked.context.repo = { owner: 'pgatzka', repo: 'pr-decorator' }
   mocked.context.payload = { pull_request: { number: PULL_NUMBER } }
@@ -380,6 +418,153 @@ describe('(i) an over-long branch name', () => {
   })
 })
 
+describe('(j) the title', () => {
+  it('is set from the linked issue on the happy path, in the same PATCH as the body', async () => {
+    setInputs({ title: 'true' })
+    const state = api()
+    install(state)
+
+    await run()
+
+    expect(patchCount()).toBe(1)
+    expect(writtenTitle(state)).toBe('#42 add the parser')
+    const params = routeCalls(PATCH_ROUTE)[0]
+    expect(params).toHaveProperty('title', '#42 add the parser')
+    expect(params).toHaveProperty('body')
+    expect(core.setFailed).not.toHaveBeenCalled()
+  })
+
+  it('is read from the issues endpoint, in the base repository', async () => {
+    const state = api()
+    install(state)
+    setInputs({ title: 'true' })
+
+    await run()
+
+    expect(routeCalls(ISSUE_ROUTE)).toEqual([
+      { owner: 'pgatzka', repo: 'pr-decorator', issue_number: '42' },
+    ])
+  })
+
+  it('defaults to true, needing no explicit input', async () => {
+    delete process.env[envName('title')]
+    const state = api()
+    install(state)
+
+    await run()
+
+    expect(writtenTitle(state)).toBe('#42 add the parser')
+  })
+
+  it('makes no request at all on a second run once title and body already match', async () => {
+    setInputs({ title: 'true' })
+    const state = api()
+    install(state)
+
+    await run()
+    expect(patchCount()).toBe(1)
+
+    vi.clearAllMocks()
+    install(state)
+    await run()
+
+    expect(patchCount()).toBe(0)
+    expect(core.notice).toHaveBeenCalledWith(expect.stringContaining('already matches'))
+  })
+
+  it('is left untouched, with no issue read at all, when title is false', async () => {
+    setInputs({ title: 'false' })
+    const state = api()
+    install(state)
+
+    await run()
+
+    expect(routeCalls(ISSUE_ROUTE)).toHaveLength(0)
+    expect(writtenTitle(state)).toBe('A title the author wrote')
+    const params = routeCalls(PATCH_ROUTE)[0]
+    expect(params).not.toHaveProperty('title')
+  })
+
+  it('is left untouched when the head branch does not match branch-pattern', async () => {
+    setInputs({ title: 'true' })
+    const state = api({ headRef: 'main' })
+    install(state)
+
+    await run()
+
+    expect(routeCalls(ISSUE_ROUTE)).toHaveLength(0)
+    expect(writtenTitle(state)).toBe('A title the author wrote')
+    // The body is still decorated; only the closing reference and the title are
+    // affected by a branch that does not carry an issue number.
+    expect(patchCount()).toBe(1)
+    expect(core.setFailed).not.toHaveBeenCalled()
+  })
+
+  it('leaves the body decorated when the issue read is denied with a 403', async () => {
+    setInputs({ title: 'true' })
+    const state = api({ issueReadStatus: 403 })
+    install(state)
+
+    await run()
+
+    expect(writtenTitle(state)).toBe('A title the author wrote')
+    expect(patchCount()).toBe(1)
+    const params = routeCalls(PATCH_ROUTE)[0]
+    expect(params).not.toHaveProperty('title')
+    expect(params).toHaveProperty('body')
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('issues: read'))
+    expect(core.setFailed).not.toHaveBeenCalled()
+  })
+
+  it('leaves the body decorated when the issue read 404s', async () => {
+    setInputs({ title: 'true' })
+    const state = api({ issueReadStatus: 404 })
+    install(state)
+
+    await run()
+
+    expect(writtenTitle(state)).toBe('A title the author wrote')
+    expect(patchCount()).toBe(1)
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('issues: read'))
+    expect(core.setFailed).not.toHaveBeenCalled()
+  })
+
+  it('logs the title it would set under dry-run, including when already correct, and writes nothing', async () => {
+    setInputs({ title: 'true', 'dry-run': 'true' })
+    const state = api({ title: '#42 add the parser' })
+    install(state)
+
+    await run()
+
+    expect(patchCount()).toBe(0)
+    expect(core.info).toHaveBeenCalledWith(expect.stringContaining('#42 add the parser'))
+  })
+
+  it('is not touched, alongside the body, on a pull request carrying the skip marker', async () => {
+    setInputs({ title: 'true' })
+    const state = api({ body: `${AUTHOR_TEXT}\n\n${SKIP_MARKER}` })
+    install(state)
+
+    await run()
+
+    expect(patchCount()).toBe(0)
+    expect(routeCalls(ISSUE_ROUTE)).toHaveLength(0)
+    expect(writtenTitle(state)).toBe('A title the author wrote')
+  })
+
+  it('is independent of issue-link: off does not turn title off', async () => {
+    setInputs({ title: 'true', 'issue-link': 'false' })
+    const state = api()
+    install(state)
+
+    await run()
+
+    expect(writtenTitle(state)).toBe('#42 add the parser')
+    const body = writtenBody(state)
+    expect(body).not.toContain('Closes #')
+  })
+})
+
 describe('a body with no room for the block', () => {
   it('warns rather than writing one the API would refuse', async () => {
     const state = api({ body: 'x'.repeat(65_450) })
@@ -469,6 +654,7 @@ describe('the mapping contracts', () => {
   const forked: PullRequestSummary = {
     body: AUTHOR_TEXT,
     bodyWasAbsent: false,
+    title: 'A title the author wrote',
     headRef: '42-add-the-parser',
     headSha: HEAD_SHA,
     baseOwner: 'pgatzka',

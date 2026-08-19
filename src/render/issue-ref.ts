@@ -1,5 +1,7 @@
 /**
- * The closing reference line — the first line of the managed block.
+ * The closing reference line — the first line of the managed block — and the
+ * issue-number derivation both the closing reference and the pull request
+ * title (#47) are built on.
  *
  * The issue number comes from the head branch name alone: no API call is made,
  * and nothing here checks that the issue exists or is open. That is deliberate.
@@ -50,21 +52,24 @@ function matchOnce(branchName: string, pattern: RegExp): RegExpExecArray | null 
 }
 
 /**
- * Renders the `Closes #<n>` line for a head branch, or nothing at all.
+ * Resolves the issue number captured from a head branch name, or `null`.
  *
- * The branch name is only ever the subject of the match, never part of the
- * pattern, so a branch called `fix/(.*)+` is data like any other name.
+ * Extracted out of {@link renderIssueReference} so the pull request title
+ * (#47) can share the exact same derivation as the closing reference: the
+ * issue number comes from one place, and the closing line and the title read
+ * it from there rather than each running their own copy of these rules.
  *
  * @param branchName - The head branch name, e.g. `142-fix-auth`. The caller has
  *   already applied the length cap from the input parser.
  * @param pattern - The compiled `branch-pattern`; capture group 1 is the issue
  *   number. Only the first group is read, so `^(?:feature|fix)\/(\d+)-` works
  *   unchanged. Not mutated.
- * @returns Exactly `Closes #<n>`, or `null` when the pattern does not match, the
- *   first group is absent or empty, the capture is not a run of ASCII digits, or
- *   the number is zero — there is no issue #0.
+ * @returns The issue number as a string — never parsed to a JS number, so an
+ *   issue past 2^53 is not rounded — or `null` when the pattern does not
+ *   match, the first group is absent or empty, the capture is not a run of
+ *   ASCII digits, or the number is zero — there is no issue #0.
  */
-export function renderIssueReference(branchName: string, pattern: RegExp): string | null {
+export function resolveIssueNumber(branchName: string, pattern: RegExp): string | null {
   const match = matchOnce(branchName, pattern)
   if (match === null) {
     return null
@@ -80,9 +85,27 @@ export function renderIssueReference(branchName: string, pattern: RegExp): strin
   // 2^53 into a different issue. An all-zeros capture strips to '' and is
   // rejected here, which is also how `0-nope` is refused.
   const number = captured.replace(LEADING_ZEROS, '')
-  if (number === '') {
-    return null
-  }
+  return number === '' ? null : number
+}
 
-  return `${CLOSING_KEYWORD} #${number}`
+/**
+ * Renders the `Closes #<n>` line for a head branch, or nothing at all.
+ *
+ * The branch name is only ever the subject of the match, never part of the
+ * pattern, so a branch called `fix/(.*)+` is data like any other name.
+ *
+ * A thin wrapper over {@link resolveIssueNumber}: this function owns nothing
+ * but the `Closes #<n>` spelling.
+ *
+ * @param branchName - The head branch name, e.g. `142-fix-auth`. The caller has
+ *   already applied the length cap from the input parser.
+ * @param pattern - The compiled `branch-pattern`; capture group 1 is the issue
+ *   number. Only the first group is read, so `^(?:feature|fix)\/(\d+)-` works
+ *   unchanged. Not mutated.
+ * @returns Exactly `Closes #<n>`, or `null` when {@link resolveIssueNumber}
+ *   returns `null`.
+ */
+export function renderIssueReference(branchName: string, pattern: RegExp): string | null {
+  const number = resolveIssueNumber(branchName, pattern)
+  return number === null ? null : `${CLOSING_KEYWORD} #${number}`
 }

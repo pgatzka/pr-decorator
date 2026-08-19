@@ -24,7 +24,7 @@ const GUARDS_SOURCE = readFileSync(
 
 /** A denial as the client raises it, for whichever call was refused. */
 function denied(
-  operation: 'updateBody' | 'getBody' = 'updateBody',
+  operation: 'updatePullRequest' | 'getWritableFields' = 'updatePullRequest',
 ): PermissionDeniedError {
   return new PermissionDeniedError(
     operation,
@@ -41,7 +41,7 @@ describe('classifyWriteFailure', () => {
 
     expect(outcome.status).toBe('skipped')
     expect(outcome.reason).toBe('permission-denied')
-    expect(outcome.operation).toBe('updateBody')
+    expect(outcome.operation).toBe('updatePullRequest')
     // Read off the error rather than hard-coded here, but the value the entrypoint
     // branches on is still pinned: anything but `warning` fails the run.
     expect(outcome.severity).toBe('warning')
@@ -52,11 +52,11 @@ describe('classifyWriteFailure', () => {
     // The body re-read immediately before the PATCH is refused by the same token
     // for the same reason. Classifying it as fatal would fail the very runs this
     // module exists to keep green.
-    const outcome = classifyWriteFailure(denied('getBody'))
+    const outcome = classifyWriteFailure(denied('getWritableFields'))
 
     expect(outcome.status).toBe('skipped')
     expect(outcome.reason).toBe('permission-denied')
-    expect(outcome.operation).toBe('getBody')
+    expect(outcome.operation).toBe('getWritableFields')
     expect(outcome.severity).toBe('warning')
   })
 
@@ -78,7 +78,7 @@ describe('classifyWriteFailure', () => {
 
   it('rethrows a fatal DecoratorError as the same instance', () => {
     const error = new GitHubApiError(
-      'updateBody',
+      'updatePullRequest',
       500,
       'Could not update the body of pull request pgatzka/pr-decorator#42. GitHub replied 500: oops',
     )
@@ -120,7 +120,7 @@ describe('guardedWrite', () => {
   })
 
   it('lets every other failure reject with the original error', async () => {
-    const error = new GitHubApiError('updateBody', 422, 'Could not update: unprocessable')
+    const error = new GitHubApiError('updatePullRequest', 422, 'Could not update: unprocessable')
 
     await expect(guardedWrite(() => Promise.reject(error))).rejects.toBe(error)
   })

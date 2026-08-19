@@ -224,7 +224,7 @@ export function capBranchName(name: string): string | null {
 }
 
 /**
- * Parses and validates all eight inputs.
+ * Parses and validates all nine inputs.
  *
  * @returns The validated configuration. Every field is known-good; no caller
  *   re-validates.
@@ -241,6 +241,7 @@ export function parseInputs(): DecoratorInputs {
     branchPattern: parseBranchPattern(),
     footer: parseBoolean('footer', true),
     mentions: parseEnum('mentions', MENTION_STYLES, 'login'),
+    title: parseBoolean('title', true),
     dryRun: parseBoolean('dry-run', false),
   }
 }

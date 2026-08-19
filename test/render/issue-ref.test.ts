@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-import { renderIssueReference } from '../../src/render/issue-ref'
+import { renderIssueReference, resolveIssueNumber } from '../../src/render/issue-ref'
 
 /**
  * `renderIssueReference` is a pure string-in/string-out function with a small,
@@ -132,6 +132,55 @@ describe('renderIssueReference', () => {
     expect(line).toBe('Closes #142')
     expect(line).toBe(line?.trim())
     expect(line).not.toMatch(/[*_`\n.]/)
+  })
+})
+
+describe('resolveIssueNumber', () => {
+  /**
+   * Extracted from `renderIssueReference` for the pull request title (#47), so
+   * every case above is re-run against the extracted function: same branch
+   * verbatim, expected value stripped of the `Closes #` prefix.
+   */
+  it.each(CASES)('$rule', ({ branch, pattern, expected }) => {
+    const number = expected === null ? null : expected.replace('Closes #', '')
+    expect(resolveIssueNumber(branch, pattern)).toBe(number)
+  })
+
+  it('strips leading zeros', () => {
+    expect(resolveIssueNumber('042-fix', DEFAULT_PATTERN)).toBe('42')
+  })
+
+  it('rejects an all-zeros capture', () => {
+    expect(resolveIssueNumber('0-nope', DEFAULT_PATTERN)).toBeNull()
+  })
+
+  it('reads a custom pattern with the number in a later position', () => {
+    expect(resolveIssueNumber('feature/77-thing', /^(?:feature|fix)\/(\d+)-/)).toBe('77')
+  })
+
+  it('returns null for a pattern with no capturing group', () => {
+    expect(resolveIssueNumber('142-fix-auth', /^\d+-/)).toBeNull()
+  })
+
+  it('returns the number as a string, never parsed', () => {
+    const number = resolveIssueNumber('9007199254740993-huge', DEFAULT_PATTERN)
+    expect(number).toBe('9007199254740993')
+    expect(typeof number).toBe('string')
+  })
+
+  it('leaves the caller pattern untouched, like renderIssueReference', () => {
+    const pattern = /(\d+)-/g
+    expect(resolveIssueNumber('x142-fix', pattern)).toBe('142')
+    expect(resolveIssueNumber('x142-fix', pattern)).toBe('142')
+    expect(pattern.lastIndex).toBe(0)
+  })
+})
+
+describe('renderIssueReference is a thin wrapper over resolveIssueNumber', () => {
+  it('composes exactly "Closes #<n>" from the resolved number', () => {
+    expect(renderIssueReference('142-fix-auth', DEFAULT_PATTERN)).toBe(
+      `Closes #${resolveIssueNumber('142-fix-auth', DEFAULT_PATTERN)}`,
+    )
   })
 })
 
