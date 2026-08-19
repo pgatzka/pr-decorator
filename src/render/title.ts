@@ -1,11 +1,16 @@
 /**
  * The pull request title: `#<issueId> <issue title, lowercased>`.
  *
- * Pure, like the rest of `src/render/**`: no `@actions/*` import and no import
- * from `src/github/`, enforced by the same eslint layering rule that guards
- * `src/render/issue-ref.ts`. The caller resolves the issue number (via
- * `resolveIssueNumber` in `issue-ref.ts`) and reads the issue title from the
- * API; this module only shapes the string.
+ * Pure, like the rest of `src/render/**`: nothing from the actions toolkit and
+ * nothing from the GitHub client layer, enforced by the same eslint layering
+ * rule that guards `src/render/issue-ref.ts`. The caller resolves the issue
+ * number (via `resolveIssueNumber` in `issue-ref.ts`) and reads the issue title
+ * from the API; this module only shapes the string.
+ *
+ * That is also why the prose below never spells those import paths — or the
+ * locale-sensitive casing call — out literally. `test/render/title.test.ts`
+ * asserts over this file's raw source text, where a mention inside a comment
+ * reads exactly like the real thing.
  *
  * The title has no delimiter the way the body has markers. When the title
  * feature is on, this string fully replaces whatever the pull request author
@@ -39,12 +44,13 @@ function normalize(issueTitle: string): string {
 /**
  * Renders the pull request title for `issueNumber` and `issueTitle`.
  *
- * Only the issue title is cased: `String.prototype.toLowerCase()`, never
- * `toLocaleLowerCase()`. The latter follows the runtime's default locale, and
- * under a Turkish one `I` maps to the dotless `ı` — the same issue would then
- * render a different title depending on which runner happened to pick up the
- * job. `toLowerCase()` has no such dependency. The `#<n>` prefix is not text
- * to case at all and is emitted verbatim.
+ * Only the issue title is cased, and always with
+ * `String.prototype.toLowerCase()` — never its locale-sensitive counterpart.
+ * That one follows the runtime's default locale, and under a Turkish one `I`
+ * maps to the dotless `ı`: the same issue would then render a different title
+ * depending on which runner happened to pick up the job. `toLowerCase()` has no
+ * such dependency. The `#<n>` prefix is not text to case at all and is emitted
+ * verbatim.
  *
  * @param issueNumber - The issue number as a string, exactly as
  *   `resolveIssueNumber` in `issue-ref.ts` returns it — never rounded, so an
