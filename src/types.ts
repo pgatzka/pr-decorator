@@ -9,7 +9,7 @@ export type Position = 'top' | 'bottom'
 /** How a commit author is rendered on the commit line. */
 export type MentionStyle = 'login' | 'name'
 
-/** The eight `action.yml` inputs, already parsed and validated. */
+/** The nine `action.yml` inputs, already parsed and validated. */
 export interface DecoratorInputs {
   /** IANA timezone name used to format commit author timestamps. */
   timezone: string
@@ -25,6 +25,14 @@ export interface DecoratorInputs {
   footer: boolean
   /** Whether authors render as `@login` or as the plain git name. */
   mentions: MentionStyle
+  /**
+   * Whether the pull request title is fully managed and set to
+   * `#<issueId> <issue title, lowercased>` when an issue number resolves from
+   * the head branch name. Independent of {@link DecoratorInputs.issueLink} —
+   * both read the number from the same branch match, but turning one off does
+   * not turn the other off.
+   */
+  title: boolean
   /** Render and log only; never write to the pull request. */
   dryRun: boolean
 }

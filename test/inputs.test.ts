@@ -86,6 +86,7 @@ describe('defaults', () => {
       branchPattern: /^(\d+)-/,
       footer: true,
       mentions: 'login',
+      title: true,
       dryRun: false,
     })
   })
@@ -126,6 +127,7 @@ describe('the defaults stay in step with action.yml', () => {
     ['branch-pattern', (parsed: DecoratorInputs) => parsed.branchPattern.source],
     ['footer', (parsed: DecoratorInputs) => String(parsed.footer)],
     ['mentions', (parsed: DecoratorInputs) => parsed.mentions],
+    ['title', (parsed: DecoratorInputs) => String(parsed.title)],
     ['dry-run', (parsed: DecoratorInputs) => String(parsed.dryRun)],
   ])('falls back to the %s default declared in action.yml', (name, read) => {
     // The runner supplies these defaults in a real run and parseInputs repeats
@@ -187,8 +189,13 @@ describe('token', () => {
 })
 
 describe('booleans', () => {
-  const BOOLEANS = ['issue-link', 'footer', 'dry-run'] as const
-  const FIELDS = { 'issue-link': 'issueLink', footer: 'footer', 'dry-run': 'dryRun' } as const
+  const BOOLEANS = ['issue-link', 'footer', 'title', 'dry-run'] as const
+  const FIELDS = {
+    'issue-link': 'issueLink',
+    footer: 'footer',
+    title: 'title',
+    'dry-run': 'dryRun',
+  } as const
 
   it.each(BOOLEANS)('parses %s as true', (name) => {
     expect(parseWith({ [name]: 'true' })[FIELDS[name]]).toBe(true)
@@ -204,6 +211,10 @@ describe('booleans', () => {
 
   it.each(['false', 'False', 'FALSE'])('accepts the YAML spelling %s', (value) => {
     expect(parseWith({ 'issue-link': value }).issueLink).toBe(false)
+  })
+
+  it('defaults to true, independent of issue-link', () => {
+    expect(parseWith({ 'issue-link': 'false' }).title).toBe(true)
   })
 
   it.each(['yes', 'no', '1', '0', 'maybe', 'TrUe'])(

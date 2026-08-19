@@ -34,6 +34,10 @@ inputs:
     description: 'How commit authors are rendered: login for @mentions, name for the plain git author name.'
     required: false
     default: 'login'
+  title:
+    description: 'Set the pull request title to "#<issue> <issue title, lowercased>" when an issue number resolves from the head branch name. The title is fully managed when this is on: whatever the author typed is replaced on every run. Needs issues: read.'
+    required: false
+    default: 'true'
   dry-run:
     description: 'Render the block and log it without writing to the pull request.'
     required: false

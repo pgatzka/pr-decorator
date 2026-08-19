@@ -29,6 +29,7 @@ const TARGET = `${OWNER}/${REPO}#${NUMBER}`
 const PULL_ROUTE = 'GET /repos/{owner}/{repo}/pulls/{pull_number}'
 const COMMITS_ROUTE = 'GET /repos/{owner}/{repo}/pulls/{pull_number}/commits'
 const PATCH_ROUTE = 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}'
+const ISSUE_ROUTE = 'GET /repos/{owner}/{repo}/issues/{issue_number}'
 
 interface RecordedCall {
   route: string
@@ -70,6 +71,7 @@ function recordingRequest(handler: (call: RecordedCall) => unknown): {
 function pullRequestPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     body: 'Author text.',
+    title: 'Add a bounded GitHub client',
     head: { ref: '5-add-a-bounded-github-client', sha: 'f'.repeat(40) },
     base: { repo: { owner: { login: OWNER }, name: REPO } },
     commits: 3,
@@ -98,6 +100,7 @@ describe('getPullRequest', () => {
     expect(pull).toEqual({
       body: 'Author text.',
       bodyWasAbsent: false,
+      title: 'Add a bounded GitHub client',
       headRef: '5-add-a-bounded-github-client',
       headSha: 'f'.repeat(40),
       baseOwner: OWNER,
@@ -156,6 +159,7 @@ describe('getPullRequest', () => {
       'bodyWasAbsent',
       'headRef',
       'headSha',
+      'title',
       'totalCommits',
     ])
   })
@@ -312,16 +316,17 @@ describe('listCommits', () => {
   })
 })
 
-describe('getBody', () => {
-  it('re-reads the current body', async () => {
+describe('getWritableFields', () => {
+  it('re-reads the current title and body together', async () => {
     const { request, calls } = recordingRequest(() =>
-      pullRequestPayload({ body: 'Edited while the action was running.' }),
+      pullRequestPayload({ body: 'Edited while the action was running.', title: 'New title' }),
     )
     const client = createGitHubClientForRequest(request)
 
-    expect(await client.getBody(OWNER, REPO, NUMBER)).toBe(
-      'Edited while the action was running.',
-    )
+    expect(await client.getWritableFields(OWNER, REPO, NUMBER)).toEqual({
+      body: 'Edited while the action was running.',
+      title: 'New title',
+    })
     expect(calls).toEqual([
       { route: PULL_ROUTE, params: { owner: OWNER, repo: REPO, pull_number: NUMBER } },
     ])
@@ -331,34 +336,96 @@ describe('getBody', () => {
     const { request } = recordingRequest(() => pullRequestPayload({ body: null }))
     const client = createGitHubClientForRequest(request)
 
-    expect(await client.getBody(OWNER, REPO, NUMBER)).toBe('')
+    expect((await client.getWritableFields(OWNER, REPO, NUMBER)).body).toBe('')
   })
 })
 
-describe('updateBody', () => {
-  it('issues exactly one PATCH carrying the body verbatim', async () => {
-    const body = '<!-- pr-decorator:start -->\nBlock\n<!-- pr-decorator:end -->\n\nAuthor text.'
-    const { request, calls } = recordingRequest(() => pullRequestPayload({ body }))
+describe('getIssueTitle', () => {
+  it('reads the issue title from the BASE repository', async () => {
+    const { request, calls } = recordingRequest(() => ({ title: 'Fix OAuth token refresh' }))
     const client = createGitHubClientForRequest(request)
 
-    await client.updateBody(OWNER, REPO, NUMBER, body)
+    expect(await client.getIssueTitle(OWNER, REPO, '142')).toBe('Fix OAuth token refresh')
+    expect(calls).toEqual([
+      { route: ISSUE_ROUTE, params: { owner: OWNER, repo: REPO, issue_number: '142' } },
+    ])
+  })
+
+  it('returns null rather than throwing on a 403', async () => {
+    const { request } = recordingRequest(() => {
+      throw new HttpError(403, 'Resource not accessible by integration')
+    })
+    const client = createGitHubClientForRequest(request)
+
+    expect(await client.getIssueTitle(OWNER, REPO, '142')).toBeNull()
+  })
+
+  it('returns null rather than throwing on a 404', async () => {
+    const { request } = recordingRequest(() => {
+      throw new HttpError(404, 'Not Found')
+    })
+    const client = createGitHubClientForRequest(request)
+
+    expect(await client.getIssueTitle(OWNER, REPO, '142')).toBeNull()
+  })
+
+  it('still classifies and throws a 500, rather than swallowing it', async () => {
+    const { request } = recordingRequest(() => {
+      throw new HttpError(500, 'Internal Server Error')
+    })
+    const client = createGitHubClientForRequest(request)
+
+    await expect(client.getIssueTitle(OWNER, REPO, '142')).rejects.toBeInstanceOf(GitHubApiError)
+  })
+})
+
+describe('updatePullRequest', () => {
+  it('issues exactly one PATCH carrying only the fields given', async () => {
+    const { request, calls } = recordingRequest(() => pullRequestPayload())
+    const client = createGitHubClientForRequest(request)
+
+    await client.updatePullRequest(OWNER, REPO, NUMBER, { body: 'New body' })
 
     expect(calls).toEqual([
       {
         route: PATCH_ROUTE,
-        params: { owner: OWNER, repo: REPO, pull_number: NUMBER, body },
+        params: { owner: OWNER, repo: REPO, pull_number: NUMBER, body: 'New body' },
       },
     ])
-    expect(calls[0]?.params.body).toBe(body)
+  })
+
+  it('carries both fields in the one PATCH when both are given', async () => {
+    const { request, calls } = recordingRequest(() => pullRequestPayload())
+    const client = createGitHubClientForRequest(request)
+
+    await client.updatePullRequest(OWNER, REPO, NUMBER, { title: 'New title', body: 'New body' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.params).toEqual({
+      owner: OWNER,
+      repo: REPO,
+      pull_number: NUMBER,
+      title: 'New title',
+      body: 'New body',
+    })
   })
 
   it('sends an empty body as an empty string rather than dropping the field', async () => {
     const { request, calls } = recordingRequest(() => pullRequestPayload())
     const client = createGitHubClientForRequest(request)
 
-    await client.updateBody(OWNER, REPO, NUMBER, '')
+    await client.updatePullRequest(OWNER, REPO, NUMBER, { body: '' })
 
     expect(calls[0]?.params).toHaveProperty('body', '')
+  })
+
+  it('makes no request at all when fields is empty', async () => {
+    const { request, calls } = recordingRequest(() => pullRequestPayload())
+    const client = createGitHubClientForRequest(request)
+
+    await client.updatePullRequest(OWNER, REPO, NUMBER, {})
+
+    expect(calls).toHaveLength(0)
   })
 })
 
@@ -392,20 +459,20 @@ describe('error classification', () => {
     const { client } = failingClient(new HttpError(403, 'Resource not accessible by integration'))
 
     const error = await client
-      .updateBody(OWNER, REPO, NUMBER, 'anything')
+      .updatePullRequest(OWNER, REPO, NUMBER, { body: 'anything' })
       .catch((cause: unknown) => cause)
 
     expect(error).toBeInstanceOf(PermissionDeniedError)
     const denied = error as PermissionDeniedError
     expect(denied.severity).toBe('warning')
-    expect(denied.operation).toBe('updateBody')
+    expect(denied.operation).toBe('updatePullRequest')
   })
 
   it.each([
     ['listCommits', (client: ReturnType<typeof createGitHubClientForRequest>) =>
       client.listCommits(OWNER, REPO, NUMBER, 1)],
-    ['getBody', (client: ReturnType<typeof createGitHubClientForRequest>) =>
-      client.getBody(OWNER, REPO, NUMBER)],
+    ['getWritableFields', (client: ReturnType<typeof createGitHubClientForRequest>) =>
+      client.getWritableFields(OWNER, REPO, NUMBER)],
   ] as const)('tags the 403 it raises from %s with that operation', async (operation, call) => {
     const { client } = failingClient(new HttpError(403, 'Forbidden'))
 

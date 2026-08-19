@@ -35,6 +35,7 @@ const EXPECTED_INPUTS = [
   'branch-pattern',
   'footer',
   'mentions',
+  'title',
   'dry-run',
 ] as const
 
@@ -46,11 +47,12 @@ const EXPECTED_DEFAULTS: Record<string, string | undefined> = {
   'branch-pattern': String.raw`^(\d+)-`,
   footer: 'true',
   mentions: 'login',
+  title: 'true',
   'dry-run': 'false',
 }
 
 describe('action.yml', () => {
-  it('declares exactly the eight v1 inputs', () => {
+  it('declares exactly the nine v1 inputs', () => {
     expect(Object.keys(action.inputs ?? {})).toEqual([...EXPECTED_INPUTS])
   })
 

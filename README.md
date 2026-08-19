@@ -1,8 +1,8 @@
 # pr-decorator
 
-A GitHub Action that writes a deterministic, marker-delimited summary block into a pull request body: the closing issue reference, the commit list, and a provenance footer.
+A GitHub Action that writes a deterministic, marker-delimited summary block into a pull request body — the closing issue reference, the commit list, and a provenance footer — and, when `title` is on (the default), sets the pull request title from the linked issue.
 
-It edits **only** the text between its own markers. Everything the author wrote outside them is never touched, never reordered and never trimmed — and if the body already says exactly what the action would write, no request is made at all.
+The body edit is scoped: it touches **only** the text between its own markers, and everything the author wrote outside them is never touched, never reordered and never trimmed. The title has no such marker — when `title` is on, it is fully replaced on every run rather than partially edited; see [Behavior worth knowing before you enable it](#behavior-worth-knowing-before-you-enable-it). Either way, if a field already says exactly what this run would write, no request is made for it — and if neither field would change, no request is made at all.
 
 ## What it writes
 
@@ -58,6 +58,7 @@ on:
 
 permissions:
   pull-requests: write
+  issues: read
 
 # Rapid pushes queue several runs on the same pull request, and only the newest
 # can produce a correct block. Keyed on the pull request number so runs on
@@ -75,6 +76,8 @@ jobs:
           timezone: Europe/Berlin
 ```
 
+`issues: read` is needed because `title` (default on) reads the linked issue's title through `GET /repos/{owner}/{repo}/issues/{n}`. Without it, the title read comes back `403`/`404`, the action logs a warning naming the missing permission and leaves the title alone — the body is still decorated and the run stays green. Set `title: false` if you would rather not grant it.
+
 There is no `actions/checkout` step, and there does not need to be: the action reads the pull request and its commits through the API and never looks at a working tree.
 
 ### Inputs
@@ -88,6 +91,7 @@ There is no `actions/checkout` step, and there does not need to be: the action r
 | `branch-pattern` | regular expression | `^(\d+)-` | no | Matched against the head branch name; capture group 1 is read as the issue number. Must declare at least one capturing group, otherwise the run fails at input parsing rather than silently rendering no line. |
 | `footer` | boolean | `true` | no | Emit the generated-by footer line at the end of the block. |
 | `mentions` | `login` \| `name` | `login` | no | How commit authors are rendered: `login` for `@mentions`, `name` for the git author name. A git name is contributor-controlled, so it is rendered in a code span; an `@login` is not, because a wrapped mention would not notify. |
+| `title` | boolean | `true` | no | Set the pull request title to `#<issue> <issue title, lowercased>` when an issue number resolves from the head branch name via `branch-pattern` — the same number `issue-link` reads. Needs `issues: read`. See [Behavior worth knowing before you enable it](#behavior-worth-knowing-before-you-enable-it). |
 | `dry-run` | boolean | `false` | no | Render the block and log it without writing to the pull request. |
 
 Booleans accept the spellings the Actions toolkit accepts: `true`, `True`, `TRUE`, `false`, `False`, `FALSE`.
@@ -111,6 +115,7 @@ on:
 
 permissions:
   pull-requests: write
+  issues: read
 
 concurrency:
   group: pr-decorator-${{ github.event.pull_request.number }}
@@ -133,6 +138,22 @@ jobs:
 
 ## Behavior worth knowing before you enable it
 
+### The title is fully managed, with no marker and no non-destructive middle ground
+
+Unlike the body, the title has no start/end marker the action can edit between. When `title` is on and an issue number resolves from the head branch name, the title is **replaced outright, on every run**, with `#<issue> <issue title, lowercased>`. Whatever the author typed as the title is gone the first time this runs — there is no way to keep part of it.
+
+If you would rather leave titles alone, set `title: false`:
+
+```yaml
+with:
+  timezone: Europe/Berlin
+  title: false
+```
+
+`title` is independent of `issue-link`: turning the closing-reference line off does not turn the title off, and vice versa — both simply read the same issue number from the head branch name.
+
+If your repository squash-merges with *Default to PR title and description for squash merge commits* enabled, the managed title becomes the squash commit subject. `#142 fix oauth token refresh` is not a closing keyword, so on its own it does not add a closing pathway beyond the ones already documented under [What this action cannot protect you from](#what-this-action-cannot-protect-you-from) — but it is worth knowing where that commit subject comes from.
+
 ### Re-runs re-mention the commit authors
 
 Every render writes the author field again. With the default `mentions: login` that means `@name` mentions are re-rendered on each write, and GitHub may notify those people again. If that is noisy for your repository, opt out:
@@ -147,9 +168,9 @@ with:
 
 ### A PAT in `token` can start a loop
 
-The default `${{ github.token }}` does **not** trigger further workflow runs — GitHub suppresses that on purpose. A personal access token supplied via `token` **does**. So a workflow that also listens on `edited` will see its own body edit, run again, and can loop.
+The default `${{ github.token }}` does **not** trigger further workflow runs — GitHub suppresses that on purpose. A personal access token supplied via `token` **does**. So a workflow that also listens on `edited` will see its own body (or title) edit, run again, and can loop.
 
-The only loop guard in this action is the **byte-identical block comparison**: before writing, the body is re-read and the new body is compared to the current one; if they are identical, no request is made and the chain stops. There is deliberately no actor check and no bot-name check — either could be defeated by a self-hosted or renamed identity, whereas the comparison cannot.
+The only loop guard in this action is the **byte-identical comparison**, applied to the body and, when `title` is on, to the title too: before writing, both are re-read and compared to what this run would write; a field that already matches is left out of the request, and a run where every field already matches makes no request at all. There is deliberately no actor check and no bot-name check — either could be defeated by a self-hosted or renamed identity, whereas the comparison cannot.
 
 In practice: with a PAT, do not put `edited` in your `types:` list.
 
